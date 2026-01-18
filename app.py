@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ==========================================
-# 🔑 パスワード設定（変更済み）
+# 🔑 パスワード設定
 # ==========================================
 LOGIN_PASSWORD = "88888"
 ADMIN_CODE = "888888"
@@ -19,7 +19,8 @@ ADMIN_CODE = "888888"
 # ==========================================
 # UI設定
 # ==========================================
-st.set_page_config(page_title="AI源太・ハゲタカスコープ", page_icon="📈", layout="wide")
+# ★変更：ページタイトルをGENTA-AIに変更
+st.set_page_config(page_title="GENTA-AI - AI理論株価分析ツール", page_icon="📈", layout="wide")
 
 hide_streamlit_style = """
             <style>
@@ -418,7 +419,8 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
 # ==========================================
 # メイン画面構築
 # ==========================================
-st.title("📈 AI源太・ハゲタカスコープ")
+# ★変更：表示タイトルをGENTA-AIに変更
+st.title("📈 GENTA-AI - AI理論株価分析ツール")
 
 with st.expander("★ ランク・評価基準の見方（クリックで詳細を表示）", expanded=False):
     st.markdown("""
@@ -483,7 +485,8 @@ if run_btn:
 
     with st.spinner(f"🚀 高速分析中..."):
         try:
-            bundle = fv.calc_fuyaseru_bundle(codes)
+            # ★変更：関数名からフヤセルを排除
+            bundle = fv.calc_genta_bundle(codes)
             st.session_state["analysis_bundle"] = bundle
             st.session_state["analysis_codes"] = codes
         except Exception as e:
