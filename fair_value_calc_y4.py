@@ -108,22 +108,39 @@ def _calc_volume_profile_wall(hist, current_price, bins=50):
     except Exception:
         return "—"
 
-def _calc_big_player_score(market_cap, pbr, volume_ratio):
+# ★更新：ハゲタカ判定ロジック（回転率・出来高倍率を追加）
+def _calc_big_player_score(market_cap, pbr, volume_ratio, turnover_pct, turnover_5d_pct):
     score = 0
+    # 1. 時価総額（中小型が狙われやすい）
     if market_cap is not None:
         mc_oku = market_cap / 100000000 
-        if 1000 <= mc_oku <= 2000: score += 50
-        elif 500 <= mc_oku < 1000: score += 40
-        elif 2000 < mc_oku <= 3000: score += 35
-        elif 300 <= mc_oku < 500: score += 20
-        elif 3000 < mc_oku <= 10000: score += 10
+        if 1000 <= mc_oku <= 2000: score += 20
+        elif 500 <= mc_oku < 1000: score += 15
+        elif 2000 < mc_oku <= 3000: score += 10
+        elif 300 <= mc_oku < 500: score += 5
     
-    if pbr is not None and 0 < pbr < 1.0: score += 20
+    # 2. PBR（割安性）
+    if pbr is not None and 0 < pbr < 1.0: score += 15
+    
+    # 3. 出来高倍率（突発的な出来高急増＝着火）
     if volume_ratio is not None:
-        if volume_ratio >= 3.0: score += 30
-        elif volume_ratio >= 2.0: score += 20
-        elif volume_ratio >= 1.5: score += 10
-    return min(95, score)
+        if volume_ratio >= 5.0: score += 25  # 異常な急増
+        elif volume_ratio >= 3.0: score += 20
+        elif volume_ratio >= 2.0: score += 10
+        elif volume_ratio >= 1.5: score += 5
+
+    # 4. 回転率（浮動株がどれだけ回ったか＝買い集め）
+    if turnover_pct is not None:
+        if turnover_pct >= 10.0: score += 20 # 1日で浮動株の10%が回る＝激アツ
+        elif turnover_pct >= 5.0: score += 15
+        elif turnover_pct >= 3.0: score += 10
+
+    # 5. 5日累積回転率（静かなる買い集め検知）
+    if turnover_5d_pct is not None:
+        if turnover_5d_pct >= 30.0: score += 20 # 1週間で浮動株の3割が入れ替わった
+        elif turnover_5d_pct >= 15.0: score += 10
+
+    return min(99, score)
 
 def _fetch_with_retry(ticker_symbol):
     for attempt in range(MAX_RETRIES):
@@ -160,7 +177,6 @@ def _fetch_single_stock(code4: str) -> dict:
     
     t, hist = _fetch_with_retry(ticker)
     
-    # ★ここを修正：データが取れない＝「存在しない銘柄」として統一
     if t is None or hist is None:
          return {
             "code": code4, "name": "存在しない銘柄", "weather": "—", "price": None, 
@@ -168,6 +184,7 @@ def _fetch_single_stock(code4: str) -> dict:
             "dividend": None, "dividend_amount": None, "growth": None, 
             "market_cap": None, "big_prob": None,
             "signal_icon": "—", "volume_wall": "—",
+            "turnover_pct": None, "volume_ratio": None, # ★追加
             "hist_data": None
         }
 
@@ -207,14 +224,13 @@ def _fetch_single_stock(code4: str) -> dict:
             else: signal_icon = "↓✖"
             
     except Exception:
-        # 計算中のエラーも「存在しない」扱いに倒すか、計算エラーとする
-        # ここでは安全のため「存在しない」扱いにします
         return {
             "code": code4, "name": "存在しない銘柄", "weather": "—", "price": None, 
             "fair_value": None, "upside_pct": None, "note": "—", 
             "dividend": None, "dividend_amount": None, "growth": None, 
             "market_cap": None, "big_prob": None,
             "signal_icon": "—", "volume_wall": "—",
+            "turnover_pct": None, "volume_ratio": None,
             "hist_data": None
         }
 
@@ -240,7 +256,36 @@ def _fetch_single_stock(code4: str) -> dict:
     roa        = get_val("returnOnAssets")
     market_cap = get_val("marketCap", "market_cap")
     avg_volume = get_val("averageVolume")
+    shares_out = get_val("sharesOutstanding")
+    float_shares = get_val("floatShares") # 浮動株
     
+    # ★追加：回転率・出来高倍率の計算
+    target_shares = float_shares if float_shares else shares_out # 浮動株優先、なければ発行済
+    
+    turnover_pct = None # 当日回転率
+    turnover_5d_pct = None # 5日累積回転率
+    volume_ratio = None # 出来高倍率
+
+    if current_volume and current_volume > 0:
+        # 1. 出来高倍率（対20日平均）
+        try:
+            vol_20d_avg = hist["Volume"].iloc[-20:].mean()
+            if vol_20d_avg and vol_20d_avg > 0:
+                volume_ratio = round(current_volume / vol_20d_avg, 2)
+            else:
+                volume_ratio = 1.0 # 比較不能な場合は1倍扱い
+        except: pass
+        
+        # 2. 回転率
+        if target_shares and target_shares > 0:
+            try:
+                # 当日
+                turnover_pct = round((current_volume / target_shares) * 100.0, 2)
+                # 5日累積
+                vol_5d_sum = hist["Volume"].iloc[-5:].sum()
+                turnover_5d_pct = round((vol_5d_sum / target_shares) * 100.0, 2)
+            except: pass
+
     long_name = info.get("longName", info.get("shortName", None))
     need_scrape = False
     if not long_name: need_scrape = True
@@ -253,9 +298,9 @@ def _fetch_single_stock(code4: str) -> dict:
             if not long_name: long_name = f"({code4})"
 
     pbr = (price / bps) if (price and bps and bps > 0) else None
-    volume_ratio = 0
-    if avg_volume and avg_volume > 0: volume_ratio = current_volume / avg_volume
-    big_prob = _calc_big_player_score(market_cap, pbr, volume_ratio)
+    
+    # ★ハゲタカ判定ロジックに関数を適用
+    big_prob = _calc_big_player_score(market_cap, pbr, volume_ratio, turnover_pct, turnover_5d_pct)
     
     div_rate = None
     raw_div = info.get("dividendRate")
@@ -279,7 +324,6 @@ def _fetch_single_stock(code4: str) -> dict:
     elif not price: note = "現在値不明"
     elif bps is None: note = "財務データ取得失敗"
     else:
-        # ★ここが予想EPSロジック：実績がプラスなら実績、実績ダメなら予想を見る
         if eps_trail is not None and eps_trail > 0: 
             calc_eps = eps_trail
         elif eps_fwd is not None and eps_fwd > 0:
@@ -287,7 +331,6 @@ def _fetch_single_stock(code4: str) -> dict:
             is_forecast = True
         
         if calc_eps is None: 
-            # 実績も予想もダメ（両方赤字かデータなし）
             if eps_trail is not None and eps_trail < 0: note = "赤字のため算出不可"
             else: note = "算出不能"
         else:
@@ -308,10 +351,11 @@ def _fetch_single_stock(code4: str) -> dict:
         "growth": rev_growth, "market_cap": market_cap, "big_prob": big_prob,
         "signal_icon": signal_icon,
         "volume_wall": volume_wall,
+        "turnover_pct": turnover_pct, # ★追加
+        "volume_ratio": volume_ratio, # ★追加
         "hist_data": hist
     }
 
-# ★変更：関数名からフヤセルを排除しGENTAに統一
 @st.cache_data(ttl=43200, show_spinner=False)
 def calc_genta_bundle(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     out = {}
@@ -331,6 +375,7 @@ def calc_genta_bundle(codes: List[str]) -> Dict[str, Dict[str, Any]]:
                 "fair_value": None, "upside_pct": None, "note": "—",
                 "dividend": None, "dividend_amount": None, "growth": None,
                 "market_cap": None, "big_prob": None, "signal_icon": "—", "volume_wall": "—",
+                "turnover_pct": None, "volume_ratio": None,
                 "hist_data": None
             }
         if progress_bar: progress_bar.progress((i + 1) / total)
