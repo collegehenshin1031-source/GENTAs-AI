@@ -19,8 +19,8 @@ ADMIN_CODE = "888888"
 # ==========================================
 # UI設定
 # ==========================================
-# ★変更：ページタイトルをGENTA-AIに変更
-st.set_page_config(page_title="GENTA-AI - AI理論株価分析ツール", page_icon="📈", layout="wide")
+# ★変更：ページタイトルを「源太ＡＩ🤖ハゲタカＳＣＯＰＥ」に変更
+st.set_page_config(page_title="源太ＡＩ🤖ハゲタカＳＣＯＰＥ", page_icon="📈", layout="wide")
 
 hide_streamlit_style = """
             <style>
@@ -419,8 +419,8 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
 # ==========================================
 # メイン画面構築
 # ==========================================
-# ★変更：表示タイトルをGENTA-AIに変更
-st.title("📈 GENTA-AI - AI理論株価分析ツール")
+# ★変更：表示タイトルを「源太ＡＩ🤖ハゲタカＳＣＯＰＥ」に変更
+st.title("源太ＡＩ🤖ハゲタカＳＣＯＰＥ")
 
 with st.expander("★ ランク・評価基準の見方（クリックで詳細を表示）", expanded=False):
     st.markdown("""
@@ -485,7 +485,6 @@ if run_btn:
 
     with st.spinner(f"🚀 高速分析中..."):
         try:
-            # ★変更：関数名からフヤセルを排除
             bundle = fv.calc_genta_bundle(codes)
             st.session_state["analysis_bundle"] = bundle
             st.session_state["analysis_codes"] = codes
