@@ -168,7 +168,8 @@ def draw_wall_chart(ticker_data: Dict[str, Any]):
         shared_yaxes=True, 
         column_widths=[0.75, 0.25], 
         horizontal_spacing=0.02,
-        subplot_titles=("📉 トレンド分析", "🧱 需給の壁")
+        # ★ここを修正しました！
+        subplot_titles=("📉 トレンド分析", "🧱 需給の壁（価格帯別出来高）")
     )
 
     # 1. ローソク足
@@ -426,7 +427,6 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
     df["上昇余地"] = df["upside_pct_num"].apply(fmt_pct)
     df["評価"] = df["stars"]
     df["売買"] = df["signal_icon"].fillna("—")
-    # ★名称変更：需給の壁 (価格帯別出来高)
     df["需給の壁 (価格帯別出来高)"] = df["volume_wall"].fillna("—")
     df["配当利回り"] = df["div_num"].apply(fmt_pct)
     df["年間配当"] = df["div_amount_num"].apply(fmt_yen)
