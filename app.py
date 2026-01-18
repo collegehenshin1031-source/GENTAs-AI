@@ -268,25 +268,26 @@ def fmt_big_prob(x):
         return f"{v:.0f}%"
     except: return "—"
 
-# ★フォーマット：浮動株・激動率（回転率）
+# ★フォーマット＆状態判定：浮動株・激動率（回転率）
 def fmt_turnover(x):
     if x is None or pd.isna(x): return "—"
     try:
         v = float(x)
-        if v >= 10.0: return f"🌪️ {v:.1f}%"
-        if v >= 5.0: return f"⚡ {v:.1f}%"
-        return f"{v:.1f}%"
+        if v >= 10.0: return f"🌪️ {v:.1f}% (激震)"
+        if v >= 5.0: return f"⚡ {v:.1f}% (活況)"
+        if v < 1.0: return f"☁ {v:.1f}% (閑散)"
+        return f"{v:.1f}% (通常)"
     except: return "—"
 
-# ★フォーマット：異常・着火倍率（出来高倍率）
+# ★フォーマット＆状態判定：異常・着火倍率（出来高倍率）
 def fmt_vol_ratio(x):
     if x is None or pd.isna(x): return "—"
     try:
         v = float(x)
-        if v >= 5.0: return f"🔥 {v:.1f}倍"
-        if v >= 3.0: return f"🚀 {v:.1f}倍"
-        if v >= 2.0: return f"⚡ {v:.1f}倍"
-        return f"{v:.1f}倍"
+        if v >= 5.0: return f"🔥 {v:.1f}倍 (緊急)"
+        if v >= 3.0: return f"🚀 {v:.1f}倍 (着火)"
+        if v >= 2.0: return f"⚡ {v:.1f}倍 (予兆)"
+        return f"{v:.1f}倍 (通常)"
     except: return "—"
 
 def calc_rating_from_upside(upside_pct):
@@ -425,7 +426,8 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
     df["上昇余地"] = df["upside_pct_num"].apply(fmt_pct)
     df["評価"] = df["stars"]
     df["売買"] = df["signal_icon"].fillna("—")
-    df["需給の壁"] = df["volume_wall"].fillna("—")
+    # ★名称変更：需給の壁 (価格帯別出来高)
+    df["需給の壁 (価格帯別出来高)"] = df["volume_wall"].fillna("—")
     df["配当利回り"] = df["div_num"].apply(fmt_pct)
     df["年間配当"] = df["div_amount_num"].apply(fmt_yen)
     df["事業の勢い"] = df["growth_num"].apply(fmt_pct)
@@ -442,7 +444,7 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
     # ★カラム配置の変更（時価総額の右にハゲタカ指標を集約）
     show_cols = [
         "ランク", "証券コード", "銘柄名", "現在値", "理論株価", "上昇余地", "評価", "売買", 
-        "需給の壁", "詳細", 
+        "需給の壁 (価格帯別出来高)", "詳細", 
         "配当利回り", "年間配当", "事業の勢い", "業績", 
         "時価総額", "大口介入", "浮動株・激動率", "異常・着火倍率", "根拠【グレアム数】"
     ]
@@ -562,7 +564,7 @@ if st.session_state["analysis_bundle"]:
             "証券コード": st.column_config.TextColumn(disabled=True),
             "銘柄名": st.column_config.TextColumn(disabled=True),
         },
-        disabled=["ランク", "証券コード", "銘柄名", "現在値", "理論株価", "上昇余地", "評価", "売買", "需給の壁", "配当利回り", "年間配当", "事業の勢い", "業績", "時価総額", "大口介入", "根拠【グレアム数】", "浮動株・激動率", "異常・着火倍率"]
+        disabled=["ランク", "証券コード", "銘柄名", "現在値", "理論株価", "上昇余地", "評価", "売買", "需給の壁 (価格帯別出来高)", "配当利回り", "年間配当", "事業の勢い", "業績", "時価総額", "大口介入", "根拠【グレアム数】", "浮動株・激動率", "異常・着火倍率"]
     )
     
     selected_rows = edited_df[edited_df["詳細"] == True]
