@@ -19,7 +19,7 @@ ADMIN_CODE = "888888"
 # ==========================================
 # UI設定
 # ==========================================
-st.set_page_config(page_title="フヤセルブレイン - AI理論株価分析ツール", page_icon="📈", layout="wide")
+st.set_page_config(page_title="AI源太・ハゲタカスコープ", page_icon="📈", layout="wide")
 
 hide_streamlit_style = """
             <style>
@@ -418,7 +418,7 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
 # ==========================================
 # メイン画面構築
 # ==========================================
-st.title("📈 フヤセルブレイン - AI理論株価分析ツール")
+st.title("📈 AI源太・ハゲタカスコープ")
 
 with st.expander("★ ランク・評価基準の見方（クリックで詳細を表示）", expanded=False):
     st.markdown("""
