@@ -19,7 +19,6 @@ ADMIN_CODE = "888888"
 # ==========================================
 # UI設定
 # ==========================================
-# ★変更：ページタイトルを「源太ＡＩ🤖ハゲタカＳＣＯＰＥ」に変更
 st.set_page_config(page_title="源太ＡＩ🤖ハゲタカＳＣＯＰＥ", page_icon="📈", layout="wide")
 
 hide_streamlit_style = """
@@ -268,6 +267,27 @@ def fmt_big_prob(x):
         if v >= 40: return f"👀 {v:.0f}%" 
         return f"{v:.0f}%"
     except: return "—"
+
+# ★追加：回転率と出来高倍率のフォーマット
+def fmt_turnover(x):
+    if x is None or pd.isna(x): return "—"
+    try:
+        v = float(x)
+        if v >= 10.0: return f"🌪️ {v:.1f}%"
+        if v >= 5.0: return f"⚡ {v:.1f}%"
+        return f"{v:.1f}%"
+    except: return "—"
+
+def fmt_vol_ratio(x):
+    if x is None or pd.isna(x): return "—"
+    try:
+        v = float(x)
+        if v >= 5.0: return f"🔥 {v:.1f}倍"
+        if v >= 3.0: return f"🚀 {v:.1f}倍"
+        if v >= 2.0: return f"⚡ {v:.1f}倍"
+        return f"{v:.1f}倍"
+    except: return "—"
+
 def calc_rating_from_upside(upside_pct):
     if upside_pct is None or pd.isna(upside_pct): return 0
     if upside_pct >= 50: return 5
@@ -348,6 +368,8 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
                       v["volume_wall"] = "—"
                       v["signal_icon"] = "—"
                       v["weather"] = "—"
+                      v["turnover_pct"] = None
+                      v["volume_ratio"] = None
                 if v.get("note") == "ETF/REIT対象外":
                       v["note"] = "ETF/REITのため対象外"
                 row = {"ticker": code, **v}
@@ -358,7 +380,11 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
         rows.append({"ticker": ",".join(codes), "name": "存在しない銘柄", "note": "—", "value": bundle})
 
     df = pd.DataFrame(rows)
-    cols = ["name", "weather", "price", "fair_value", "upside_pct", "dividend", "dividend_amount", "growth", "market_cap", "big_prob", "note", "signal_icon", "volume_wall"]
+    # ★カラム追加
+    cols = ["name", "weather", "price", "fair_value", "upside_pct", "dividend", "dividend_amount", 
+            "growth", "market_cap", "big_prob", "note", "signal_icon", "volume_wall",
+            "turnover_pct", "volume_ratio"]
+            
     for col in cols:
         if col not in df.columns: df[col] = None
 
@@ -404,12 +430,18 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
     df["事業の勢い"] = df["growth_num"].apply(fmt_pct)
     df["時価総額"] = df["mc_num"].apply(fmt_market_cap)
     df["大口介入"] = df["prob_num"].apply(fmt_big_prob)
+    
+    # ★追加：フォーマット適用
+    df["回転率"] = df["turnover_pct"].apply(fmt_turnover)
+    df["出来高倍率"] = df["volume_ratio"].apply(fmt_vol_ratio)
 
     df.index = df.index + 1
     df["詳細"] = False
     
+    # ★カラム順序の調整（重要度が高い順に）
     show_cols = [
-        "ランク", "証券コード", "銘柄名", "現在値", "理論株価", "上昇余地", "評価", "売買", "需給の壁",
+        "ランク", "証券コード", "銘柄名", "現在値", "理論株価", "上昇余地", "評価", "売買", 
+        "回転率", "出来高倍率", "需給の壁", # ここに追加！
         "詳細", 
         "配当利回り", "年間配当", "事業の勢い", "業績", "時価総額", "大口介入", "根拠【グレアム数】"
     ]
@@ -419,7 +451,6 @@ def bundle_to_df(bundle: Any, codes: List[str]) -> pd.DataFrame:
 # ==========================================
 # メイン画面構築
 # ==========================================
-# ★変更：表示タイトルを「源太ＡＩ🤖ハゲタカＳＣＯＰＥ」に変更
 st.title("源太ＡＩ🤖ハゲタカＳＣＯＰＥ")
 
 with st.expander("★ ランク・評価基準の見方（クリックで詳細を表示）", expanded=False):
