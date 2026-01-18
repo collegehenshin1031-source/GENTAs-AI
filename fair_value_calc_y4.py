@@ -311,8 +311,9 @@ def _fetch_single_stock(code4: str) -> dict:
         "hist_data": hist
     }
 
+# ★変更：関数名からフヤセルを排除しGENTAに統一
 @st.cache_data(ttl=43200, show_spinner=False)
-def calc_fuyaseru_bundle(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+def calc_genta_bundle(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     out = {}
     total = len(codes)
     progress_bar = None
