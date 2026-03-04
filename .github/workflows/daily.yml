@@ -45,8 +45,7 @@ jobs:
 
       - name: Send Email Notifications
         env:
-          # ★本番稼働させる時に、下の "false" を "true" に書き換えます★
-          ENABLE_EMAIL: "false"
+          ENABLE_EMAIL: "true"
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           GSHEETS_CREDENTIALS: ${{ secrets.GSHEETS_CREDENTIALS }}
           SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
