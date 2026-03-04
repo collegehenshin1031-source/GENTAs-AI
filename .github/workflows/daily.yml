@@ -1,0 +1,59 @@
+name: Daily Update & Notification
+
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fetch volume data
+        run: python fetch_data.py
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/ratios.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "📊 Update volume data $(date +'%Y-%m-%d %H:%M')"
+          git push
+
+      - name: Send Email Notifications
+        env:
+          # ★本番稼働させる時に、下の "false" を "true" に書き換えます★
+          ENABLE_EMAIL: "false"
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          GSHEETS_CREDENTIALS: ${{ secrets.GSHEETS_CREDENTIALS }}
+          SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
+        run: |
+          if [ "$ENABLE_EMAIL" = "true" ]; then
+            echo "Starting email notification process..."
+            python send_notifications.py
+          else
+            echo "Email notification is currently DISABLED. Set ENABLE_EMAIL to true to activate."
+          fi
