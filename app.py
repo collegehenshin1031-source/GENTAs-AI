@@ -13,6 +13,7 @@ HAGETAKA SCOPE - M&A候補検知ツール
 - ダークモード時のロゴ自動最適化（白パネル追加）
 - ハゲタカ診断結果の独立カード（枠線）化
 - 【改善】フローティングボタン（カート）を青系に変更し視認性向上
+- 【修正】英字コード（151Aなど）の完全対応と全角/改行コピペ対応
 """
 
 import json
@@ -440,7 +441,15 @@ def get_jpx_data():
         xls_response.raise_for_status()
         df = pd.read_excel(io.BytesIO(xls_response.content))
         df_tickers = df[df.iloc[:, 3].isin(['プライム', 'スタンダード', 'グロース'])]
-        codes = df_tickers.iloc[:, 1].apply(lambda x: str(int(float(x))) if pd.notnull(x) and str(x).replace('.','').isdigit() else "")
+        
+        # 🌟 英字入りコード対応のためのパース処理
+        def safe_code(x):
+            if pd.isnull(x): return ""
+            s = str(x).strip()
+            if s.endswith('.0'): return s[:-2]
+            return s
+            
+        codes = df_tickers.iloc[:, 1].apply(safe_code)
         name_map = dict(zip(codes, df_tickers.iloc[:, 2]))
         return name_map, list(name_map.keys())
     except Exception:
@@ -466,12 +475,17 @@ TICKER_NAMES_JP = {
     "4054.T": "日本情報クリエイト", "6095.T": "メドピア", "4436.T": "ミンカブ", "4477.T": "BASE",
 }
 
+# 🌟 全角半角・スペース・改行・大文字小文字をすべて吸収してコードを抽出する関数
 def normalize_input(input_text):
     if not input_text: return []
-    text = unicodedata.normalize('NFKC', input_text)
-    text = text.replace(',', ' ').replace('、', ' ').replace('\n', ' ')
+    # 全角を半角に、小文字を大文字に統一（151a -> 151A）
+    text = unicodedata.normalize('NFKC', input_text).upper()
+    # スペース、改行、カンマなどをすべて半角スペースに変換
+    text = re.sub(r'[\s,、\n\r]+', ' ', text)
+    # 分割して空白を除去
     codes = [c.strip() for c in text.split(' ') if c.strip()]
-    return list(set(codes))
+    # 重複を削除して返す（順序は維持）
+    return list(dict.fromkeys(codes))
 
 def check_dna(hist):
     try:
@@ -496,11 +510,16 @@ def evaluate_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="2y")
-        if len(hist) < 30: return None
+        
+        # 🚨 修正ポイント：日数が少なくてもエラーにせず、最低5日あれば計算を通す
+        if hist.empty or len(hist) < 5: 
+            return None
 
         current_price = hist['Close'].iloc[-1]
         current_vol = hist['Volume'].iloc[-1]
-        avg_vol_100 = hist['Volume'][-100:].mean()
+        
+        # 少ない日数でも計算できるように修正
+        avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
         info = stock.info
         
         market_cap = info.get('marketCap', 0)
@@ -555,7 +574,9 @@ def evaluate_stock(ticker):
         price_bins = pd.cut(hist_6mo['Close'], bins=15)
         vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
         max_vol_price = vol_profile.idxmax().mid
-        recent_20_low = hist['Low'][-20:].min()
+        
+        # 少ない日数でも対応できるように修正
+        recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
 
         upside_potential = 0
         is_blue_sky = False
@@ -1117,7 +1138,8 @@ def show_main_page():
         
         st.markdown("##### 🔍 気になる銘柄を入力")
         with st.form(key='search_form'):
-            input_code = st.text_input("銘柄コード", value=default_input, placeholder="例: 7011 7203 9984 (スペース区切りで複数可)", label_visibility="collapsed")
+            # 🌟 入力欄をコピペしやすくしつつ、高さを最小限に抑えて見た目を維持
+            input_code = st.text_area("銘柄コード", value=default_input, placeholder="例: 7011 7203 151A\n改行やスペース区切りで複数入力できます", label_visibility="collapsed", height=68)
             search_btn = st.form_submit_button("🦅 ハゲタカAIで診断する")
             
         if search_btn and input_code:
@@ -1129,7 +1151,6 @@ def show_main_page():
             else:
                 with st.spinner(f'🦅 {len(codes)}銘柄を精密検査中...'):
                     for code in codes:
-                        if not code.isdigit(): continue
                         diag_data = evaluate_stock(f"{code}.T")
                         if diag_data:
                             # 💡 診断結果をカードで囲んで区切りを明確に
@@ -1216,7 +1237,8 @@ def show_main_page():
 
                                 draw_chart(diag_data)
                         else: 
-                            st.error(f"❌ {code}: データ取得エラー")
+                            # 🚨 ここが確実に表示されるように修正
+                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。（存在しない銘柄、または上場直後でデータが不足しています）")
 
     # ==========================================
     # タブ3: 通知設定
