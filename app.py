@@ -14,6 +14,7 @@ HAGETAKA SCOPE - M&A候補検知ツール
 - ハゲタカ診断結果の独立カード（枠線）化
 - 【改善】フローティングボタン（カート）を青系に変更し視認性向上
 - 【修正】英字コード（151Aなど）の完全対応と全角/改行コピペ対応
+- 【修正】yfinanceのデータ欠損（None）による診断エラーを完全解消
 """
 
 import json
@@ -522,8 +523,9 @@ def evaluate_stock(ticker):
         avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
         info = stock.info
         
-        market_cap = info.get('marketCap', 0)
-        shares = info.get('sharesOutstanding', 0)
+        # 🚨 修正ポイント：yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
+        market_cap = info.get('marketCap') or 0
+        shares = info.get('sharesOutstanding') or 0
         if market_cap == 0: market_cap = current_price * shares
         market_cap_oku = market_cap / 100000000
         
@@ -571,10 +573,18 @@ def evaluate_stock(ticker):
             intervention_name = "⚠️ 短期資金・過熱度 (超小型)"
 
         hist_6mo = hist.tail(125)
-        price_bins = pd.cut(hist_6mo['Close'], bins=15)
-        vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
-        max_vol_price = vol_profile.idxmax().mid
         
+        # 🚨 修正ポイント：価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ
+        if hist_6mo['Close'].nunique() > 1:
+            price_bins = pd.cut(hist_6mo['Close'], bins=15)
+            vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
+            try:
+                max_vol_price = vol_profile.idxmax().mid
+            except Exception:
+                max_vol_price = current_price
+        else:
+            max_vol_price = current_price
+            
         # 少ない日数でも対応できるように修正
         recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
 
