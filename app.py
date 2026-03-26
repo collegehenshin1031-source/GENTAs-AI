@@ -17,7 +17,7 @@ HAGETAKA SCOPE - M&A候補検知ツール
 - 【修正】yfinanceのデータ欠損（None）による診断エラーを完全解消
 - 【追加修正】エラー（データ取得失敗）時にキャッシュさせない仕様に変更
 - 【追加修正】データ取得エラー時のメッセージに「アクセス集中」の旨を追記
-- 【最適解】ブラウザ偽装と自動リトライ(Exponential Backoff)による通信制限の極限回避
+- 【究極防壁】ブラウザ偽装のランダム化と人間らしいヘッダー付与で長期間ブロックを極限回避
 """
 
 import json
@@ -69,15 +69,29 @@ DISCLAIMER_TEXT = "本ツールは市場データの可視化を目的とした�
 # ==========================================
 # 【最強の通信セッション構築】
 # ==========================================
+# 複数のブラウザ（Chrome, Safari, Firefox等）の身分証を用意
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+]
+
 def get_yf_session():
     """Bot弾きを回避し、弾かれても自動リトライするセッションを作成"""
     session = requests.Session()
-    # 429(Too Many Requests)や50xエラー時に、最大3回まで間隔を空けて自動リトライ
-    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    # 429(Too Many Requests)や50xエラー時に、最大5回まで間隔を空けて自動リトライ
+    retries = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
-    # 一般的なGoogle Chromeブラウザからのアクセスに偽装する
+    
+    # 一般的なブラウザからのアクセスにランダムで偽装し、人間らしいヘッダーを付与
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
     })
     return session
 
