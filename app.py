@@ -15,6 +15,9 @@ HAGETAKA SCOPE - M&A候補検知ツール
 - 【改善】フローティングボタン（カート）を青系に変更し視認性向上
 - 【修正】英字コード（151Aなど）の完全対応と全角/改行コピペ対応
 - 【修正】yfinanceのデータ欠損（None）による診断エラーを完全解消
+- 【追加修正】エラー（データ取得失敗）時にキャッシュさせない仕様に変更
+- 【追加修正】データ取得エラー時のメッセージに「アクセス集中」の旨を追記
+- 【最適解】ブラウザ偽装と自動リトライ(Exponential Backoff)による通信制限の極限回避
 """
 
 import json
@@ -22,6 +25,8 @@ import re
 import smtplib
 import io
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import random
 import unicodedata
 from email.mime.multipart import MIMEMultipart
@@ -60,6 +65,23 @@ LEVEL_COLORS = {4: "#C41E3A", 3: "#FF9800", 2: "#FFC107", 1: "#5C6BC0", 0: "#9E9
 
 MASTER_PASSWORD = "88888"
 DISCLAIMER_TEXT = "本ツールは市場データの可視化を目的とした補助ツールです。<br>銘柄推奨・売買助言ではありません。最終判断は利用者ご自身で行ってください。"
+
+# ==========================================
+# 【最強の通信セッション構築】
+# ==========================================
+def get_yf_session():
+    """Bot弾きを回避し、弾かれても自動リトライするセッションを作成"""
+    session = requests.Session()
+    # 429(Too Many Requests)や50xエラー時に、最大3回まで間隔を空けて自動リトライ
+    retries = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    # 一般的なGoogle Chromeブラウザからのアクセスに偽装する
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    })
+    return session
+
+yf_session = get_yf_session()
 
 # ==========================================
 # カート操作のコールバック関数（即時反映用）
@@ -506,251 +528,259 @@ def format_market_cap(oku_val):
         return f"{cho}兆円" if oku == 0 else f"{cho}兆{oku}億円"
     return f"{oku_val}億円"
 
+# 🚨 【エラー回避＆キャッシュ対策】の内部関数（データ取得失敗時は例外を投げてキャッシュさせない）
 @st.cache_data(ttl=900, show_spinner=False)
+def _evaluate_stock_cached(ticker):
+    # 【最適解】ブラウザ偽装セッションを使ってデータを取得
+    stock = yf.Ticker(ticker, session=yf_session)
+    hist = stock.history(period="2y")
+    
+    # 少ない日数や取得失敗（アクセス集中等）時は例外を出してキャッシュ化を回避する
+    if hist.empty or len(hist) < 5: 
+        raise ValueError("Insufficient data or fetch limit")
+
+    current_price = hist['Close'].iloc[-1]
+    current_vol = hist['Volume'].iloc[-1]
+    
+    # 少ない日数でも計算できるように修正
+    avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
+    info = stock.info
+    
+    # yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
+    market_cap = info.get('marketCap') or 0
+    shares = info.get('sharesOutstanding') or 0
+    if market_cap == 0: market_cap = current_price * shares
+    market_cap_oku = market_cap / 100000000
+    
+    formatted_mcap = format_market_cap(market_cap_oku)
+
+    turnover_rate = (current_vol / shares) * 100 if shares > 0 and current_vol > 0 else 0
+        
+    if turnover_rate >= 10.0: turnover_str = f"🔥🔥🔥 {turnover_rate:.2f}% (超異常値・大相場警戒)"
+    elif turnover_rate >= 5.0: turnover_str = f"🔥🔥 {turnover_rate:.2f}% (異常値・大口介入期待高)"
+    elif turnover_rate >= 2.0: turnover_str = f"🔥 {turnover_rate:.2f}% (動意づき)"
+    elif turnover_rate > 0: turnover_str = f"💤 {turnover_rate:.2f}% (平常運転)"
+    else: turnover_str = "算出不可"
+
+    dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
+    payout_ratio = info.get('payoutRatio') or 0
+    div_yield = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0
+
+    if dividend_rate > 0:
+        payout_str = f"{payout_ratio * 100:.1f}%" if payout_ratio > 0 else "-"
+        yield_str = f"{div_yield * 100:.2f}%" if div_yield > 0 else "-"
+        dividend_text = f"{dividend_rate}円 （利回り: {yield_str} / 配当性向: {payout_str}）"
+    else:
+        dividend_text = "無配"
+
+    code_only = ticker.replace(".T", "")
+    jp_name = jpx_names.get(code_only)
+    if not jp_name or re.search(r'[a-zA-Z]', jp_name):
+        try:
+            url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
+            # JP名前取得用にも偽装セッションを使用
+            res_yfjp = yf_session.get(url_yfjp, timeout=3)
+            match = re.search(r'<title>(.+?)(?:\(株\))?【', res_yfjp.text)
+            if match: jp_name = match.group(1).strip()
+            else: jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
+        except:
+            jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
+
+    if market_cap_oku >= 5000:
+        cap_category = "large"
+        intervention_name = "🏢 機関投資家・大口流入期待度"
+    elif market_cap_oku >= 50:
+        cap_category = "target"
+        intervention_name = "🦅 大口資金・介入期待度 (目安)"
+    else:
+        cap_category = "small"
+        intervention_name = "⚠️ 短期資金・過熱度 (超小型)"
+
+    hist_6mo = hist.tail(125)
+    
+    # 価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ
+    if hist_6mo['Close'].nunique() > 1:
+        price_bins = pd.cut(hist_6mo['Close'], bins=15)
+        vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
+        try:
+            max_vol_price = vol_profile.idxmax().mid
+        except Exception:
+            max_vol_price = current_price
+    else:
+        max_vol_price = current_price
+        
+    recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
+
+    upside_potential = 0
+    is_blue_sky = False
+    
+    if current_price >= max_vol_price:
+        is_blue_sky = True
+    else:
+        upside_potential = ((max_vol_price - current_price) / current_price) * 100
+
+    deviation = ((current_price - max_vol_price) / max_vol_price) * 100
+
+    if is_blue_sky: pot_level = 4
+    elif upside_potential >= 30: pot_level = 3
+    elif upside_potential >= 15: pot_level = 2
+    elif upside_potential >= 5: pot_level = 1
+    else: pot_level = 0
+
+    max_stars = 5 if deviation <= 10.0 else 4 if deviation <= 20.0 else 3
+    raw_stars = pot_level + 1
+    final_stars = min(raw_stars, max_stars)
+    star_rating = "★" * final_stars + "☆" * (5 - final_stars)
+
+    if raw_stars > final_stars:
+        if final_stars == 4:
+            patterns = [
+                ("【上昇トレンド・高値警戒】", "上値の壁は薄いものの、直近底値からの上昇が続いており、新規参入は短期目線での対応が無難な水準です。"),
+                ("【モメンタム継続・押し目待ち】", "強い勢いを保っていますが、やや過熱感が出てきました。リスクを抑えるなら押し目を待つのが一案です。"),
+                ("【高値圏の順張り局面】", "上値余地はありますが、すでに一定の上昇を遂げています。利益確定売りに警戒しつつの判断が求められます。")
+            ]
+        else:
+            patterns = [
+                ("【高値圏のモメンタム相場】", "上値を抑える壁はなく強いトレンドですが、乖離率が高く高値掴みのリスクがあります。短期戦と割り切った対応が求められる水準です。"),
+                ("【急騰後・リスクリワード低下】", "勢いは非常に強いものの、今からの新規エントリーはリスクとリターンのバランスが取りにくくなっています。慎重な判断が必要です。"),
+                ("【過熱気味の上昇波】", "上値余地を残しつつも、テクニカル的には過熱感が漂います。無理に深追いせず、冷静に状況を見極めたい局面です。")
+            ]
+    else:
+        if pot_level == 4:
+            patterns = [
+                ("【青天井モード】", "上値に目立った需給の壁（抵抗線）がなく、売り手が不在の真空地帯に突入しています。"),
+                ("【上値抵抗クリア】", "過去の重いしこり玉（含み損）エリアを突破しており、需給が好転している局面です。"),
+                ("【真空地帯への突入】", "目立った戻り売り圧力が少なく、トレンドに逆らわない順張りが有効な水準です。"),
+                ("【売り手不在の快晴】", "上値での迷いが生じにくく、資金流入がストレートに株価に反映されやすい帯域にいます。"),
+                ("【需給良好・上値追い】", "過去の取引の壁を抜けました。ただし、急ピッチな上昇時は利食いにも留意してください。"),
+                ("【視界良好チャート】", "上値を抑えつける強固な壁が見当たりません。資金の逃げ足にだけ注意して波に乗りたい位置です。")
+            ]
+        elif pot_level == 3:
+            patterns = [
+                ("【大幅な上値余地】", "強固な抵抗線まで距離があり、大きな値幅取りが狙えるポテンシャルを秘めています。"),
+                ("【上値余地：特大】", "最大の壁まで十分な空間が開いており、大口の仕掛けが入りやすいエリアです。"),
+                ("【リバウンド妙味】", "上値の重い水準まで距離があるため、反発トレンドに乗れた際のリターンが大きくなりやすい形状です。"),
+                ("【ターゲット遠方】", "主要なヤレヤレ売りが降ってくる水準まで、軽快な足取りが期待できます。"),
+                ("【絶好の上昇空間】", "次の大きな節目まで邪魔する壁がなく、買い圧力が素直に効きやすいチャートです。"),
+                ("【値幅取り期待ゾーン】", "出来高の壁まで距離的余裕があり、トレンド発生時の爆発力に期待が持てる位置取りです。")
+            ]
+        elif pot_level == 2:
+            patterns = [
+                ("【堅実な上値余地】", "次の抵抗帯まで適度な距離があり、セオリー通りの着実な上昇が見込めます。"),
+                ("【上値余地：中】", "極端な遠さではありませんが、壁に到達するまで十分に利益を狙える水準にあります。"),
+                ("【標準的なターゲット】", "最も分厚い出来高の壁に向けて、じわじわと水準を切り上げる展開が期待されます。"),
+                ("【ステップアップ局面】", "まずは直上の壁を目標に、資金の流入に伴って堅調に推移しやすい位置です。"),
+                ("【適度な空間】", "壁までの距離感として「ちょうど狙いやすい」位置取り。押し目があれば拾いたい形状です。"),
+                ("【トレンド追従向きの局面】", "上値抵抗までの道のりは見えており、無理のない範囲で波に乗るのが有効な局面です。")
+            ]
+        elif pot_level == 1:
+            patterns = [
+                ("【抵抗帯接近】", "すぐ上に出来高の壁が迫っています。ここを突破できるかが目先の最大の焦点となります。"),
+                ("【激戦区への突入】", "過去の取引が密集するエリアが間近です。売り買いが交錯しやすく、乱高下に注意が必要です。"),
+                ("【上値の壁テスト】", "分厚い壁へのアタック局面。跳ね返されるリスクも考慮し、打診買いから入りたい水準です。"),
+                ("【ブレイク前夜警戒】", "すぐ上の抵抗線を明確に上抜ければ景色が一変しますが、現状はまだ重い壁の下に位置しています。"),
+                ("【上値余地：小】", "ターゲットまでの距離が短く、ここから新規で大きな値幅を狙うにはややリスクが伴う位置です。"),
+                ("【壁打ち反落リスク】", "壁にぶつかって反落する「壁打ち」になりやすい位置。突破を確認してからの参戦でも遅くありません。")
+            ]
+        else:
+            patterns = [
+                ("【頭打ち警戒】", "現在値のすぐ上に強烈なしこり玉が大量待機しており、上値が極めて重い状態です。"),
+                ("【岩盤到達・上値重し】", "過去最大の出来高を記録した価格帯に突入しています。大量の戻り売りを消化する莫大なパワーが必要です。"),
+                ("【ヤレヤレ売り集中エリア】", "「買値に戻ったら売ろう」と待っていた投資家の売りが降り注ぐ、最も苦しい価格帯です。"),
+                ("【上値抵抗MAX】", "需給面での障壁が一番高いエリアです。好材料などの強力なエンジンがない限り、突破は困難です。"),
+                ("【ブレイクアウト待ちが一案】", "この分厚い壁の中での勝負は分が悪いです。明確に上抜けて真空地帯に入るのを待つのが賢明です。"),
+                ("【撤退ラインの徹底が重要】", "壁に跳ね返されて急落するリスクが高い水準です。保有している場合は利益確定も視野に入る位置と言えます。")
+            ]
+
+    selected_pattern = random.choice(patterns)
+    star_desc = selected_pattern[0]
+    base_logic = selected_pattern[1]
+
+    flavor_logic = ""
+    if cap_category == "large": flavor_logic = "時価総額が巨大なため値動きは重めですが、機関投資家や外国人投資家の資金流入をエンジンとした、強力で重厚なトレンドが期待できます。"
+    elif cap_category == "target": flavor_logic = "中小型株として大口資金が最も好む規模感であり、資金が投下されれば一気に株価が動意づく（または壁を突破する）ポテンシャルを秘めています。"
+    else: flavor_logic = "※ただし時価総額が小さすぎるため、プロは資金を入れづらい銘柄です。主に個人投資家による短期的な値幅取りの対象（乱高下）になりやすいため、リスク管理を徹底してください。"
+
+    star_logic = base_logic + "<br><br>" + flavor_logic
+
+    past_1y = hist[-250:]
+    year_high = past_1y['High'].max()
+    year_low = past_1y['Low'].min()
+    position_score = 0.5
+    if year_high != year_low:
+        position_score = (current_price - year_low) / (year_high - year_low)
+        
+    has_dna = check_dna(hist)
+    vol_ratio = current_vol / avg_vol_100 if avg_vol_100 > 0 else 0
+    
+    is_platinum = 500 <= market_cap_oku <= 2000
+    is_magma = vol_ratio >= 1.5
+
+    safe_judgment, safe_explain = "", ""
+    if deviation <= -5.0:
+        safe_judgment = "📉 割安：底値仕込みが適切とされるゾーン（任意）"
+        safe_explain = "現在値が需給の壁より下に位置する「割安圏」です。直近底値（青の点線）を割ったら撤退というルールで、安値で仕込めるチャンスと言えます。"
+    elif deviation <= 0.0:
+        safe_judgment = "⚔️ 激戦：ブレイク前夜期待"
+        safe_explain = "分厚い需給の壁へのアタック目前です。ここを明確に上抜ければ一気に青空が広がる激戦区と位置付けられます。"
+    elif deviation <= 10.0:
+        safe_judgment = "🚀 安全圏：トレンド初動かも！？"
+        safe_explain = "需給の壁を突破したばかりで、最も素直に上昇の波に乗りやすいベストタイミングになりやすい水準です。"
+    elif deviation <= 20.0:
+        safe_judgment = "⚠️ 警戒：短期過熱気味警戒レベル"
+        safe_explain = "壁の突破から一定の上昇をしており少し離れすぎました。壁付近までの「押し目（下落）」を待つのが無難です。"
+    else:
+        safe_judgment = "💀 高度な警戒：高値掴みリスク大"
+        safe_explain = "壁から完全に乖離した超高値圏です。今から飛び乗るのは極めて危険で、上級者でも難しいゾーンのため注意必須です。"
+
+    intervention_score = 0
+    if is_platinum: intervention_score += 35
+    elif 100 <= market_cap_oku <= 5000: intervention_score += 15
+    if vol_ratio >= 3.0: intervention_score += 40
+    elif vol_ratio >= 1.5: intervention_score += 25
+    if position_score <= 0.2: intervention_score += 15
+    if has_dna: intervention_score += 10
+    
+    intervention_score = int(round(min(intervention_score, 100) / 10.0)) * 10
+    intervention_score = max(10, min(intervention_score, 90))
+    
+    intervention_comment = ""
+    if intervention_score >= 80: intervention_comment = "🚨 【極めて濃厚】大規模な資金流入のシグナルが点灯しています。"
+    elif intervention_score >= 50: intervention_comment = "👀 【予兆あり】平常時とは異なる資金の動きが観測されています。"
+    else: intervention_comment = "💤 【静観】現在は目立った資金流入の動きは検出されていません。"
+
+    base_rank = "D"
+    if intervention_score >= 80 and (is_blue_sky or upside_potential >= 30): base_rank = "S"
+    elif intervention_score >= 70: base_rank = "A"
+    elif intervention_score >= 50 or (is_platinum and position_score <= 0.5): base_rank = "B"
+    else: base_rank = "C"
+
+    warning_text = "【注意】※安全性を要確認" if deviation > 20 else ""
+
+    icons_list = []
+    if has_dna: icons_list.append("🧬")
+    if is_platinum: icons_list.append("💎")
+    if is_magma: icons_list.append("🦅")
+    icons_str = " ".join(icons_list)
+
+    return {
+        "コード": code_only, "銘柄名": jp_name, "現在値": int(current_price),
+        "時価総額": market_cap_oku, "時価総額_表示": formatted_mcap, "dividend_text": dividend_text,
+        "turnover_str": turnover_str, "ランク": base_rank, "警告": warning_text,
+        "乖離率": deviation, "hist": hist, "max_vol_price": max_vol_price,
+        "recent_20_low": recent_20_low, "star_rating": star_rating, "star_desc": star_desc,
+        "star_logic": star_logic, "intervention_name": intervention_name,
+        "intervention_score": intervention_score, "intervention_comment": intervention_comment,
+        "safe_judgment": safe_judgment, "safe_explain": safe_explain, "icons_str": icons_str
+    }
+
+# 🚨 【呼び出し元関数】エラー時はキャッシュせずに例外を受け流す
 def evaluate_stock(ticker):
     try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="2y")
-        
-        # 🚨 修正ポイント：日数が少なくてもエラーにせず、最低5日あれば計算を通す
-        if hist.empty or len(hist) < 5: 
-            return None
-
-        current_price = hist['Close'].iloc[-1]
-        current_vol = hist['Volume'].iloc[-1]
-        
-        # 少ない日数でも計算できるように修正
-        avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
-        info = stock.info
-        
-        # 🚨 修正ポイント：yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
-        market_cap = info.get('marketCap') or 0
-        shares = info.get('sharesOutstanding') or 0
-        if market_cap == 0: market_cap = current_price * shares
-        market_cap_oku = market_cap / 100000000
-        
-        formatted_mcap = format_market_cap(market_cap_oku)
-
-        turnover_rate = (current_vol / shares) * 100 if shares > 0 and current_vol > 0 else 0
-            
-        if turnover_rate >= 10.0: turnover_str = f"🔥🔥🔥 {turnover_rate:.2f}% (超異常値・大相場警戒)"
-        elif turnover_rate >= 5.0: turnover_str = f"🔥🔥 {turnover_rate:.2f}% (異常値・大口介入期待高)"
-        elif turnover_rate >= 2.0: turnover_str = f"🔥 {turnover_rate:.2f}% (動意づき)"
-        elif turnover_rate > 0: turnover_str = f"💤 {turnover_rate:.2f}% (平常運転)"
-        else: turnover_str = "算出不可"
-
-        dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
-        payout_ratio = info.get('payoutRatio') or 0
-        div_yield = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0
-
-        if dividend_rate > 0:
-            payout_str = f"{payout_ratio * 100:.1f}%" if payout_ratio > 0 else "-"
-            yield_str = f"{div_yield * 100:.2f}%" if div_yield > 0 else "-"
-            dividend_text = f"{dividend_rate}円 （利回り: {yield_str} / 配当性向: {payout_str}）"
-        else:
-            dividend_text = "無配"
-
-        code_only = ticker.replace(".T", "")
-        jp_name = jpx_names.get(code_only)
-        if not jp_name or re.search(r'[a-zA-Z]', jp_name):
-            try:
-                url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-                res_yfjp = requests.get(url_yfjp, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
-                match = re.search(r'<title>(.+?)(?:\(株\))?【', res_yfjp.text)
-                if match: jp_name = match.group(1).strip()
-                else: jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
-            except:
-                jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
-
-        if market_cap_oku >= 5000:
-            cap_category = "large"
-            intervention_name = "🏢 機関投資家・大口流入期待度"
-        elif market_cap_oku >= 50:
-            cap_category = "target"
-            intervention_name = "🦅 大口資金・介入期待度 (目安)"
-        else:
-            cap_category = "small"
-            intervention_name = "⚠️ 短期資金・過熱度 (超小型)"
-
-        hist_6mo = hist.tail(125)
-        
-        # 🚨 修正ポイント：価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ
-        if hist_6mo['Close'].nunique() > 1:
-            price_bins = pd.cut(hist_6mo['Close'], bins=15)
-            vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
-            try:
-                max_vol_price = vol_profile.idxmax().mid
-            except Exception:
-                max_vol_price = current_price
-        else:
-            max_vol_price = current_price
-            
-        # 少ない日数でも対応できるように修正
-        recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
-
-        upside_potential = 0
-        is_blue_sky = False
-        
-        if current_price >= max_vol_price:
-            is_blue_sky = True
-        else:
-            upside_potential = ((max_vol_price - current_price) / current_price) * 100
-
-        deviation = ((current_price - max_vol_price) / max_vol_price) * 100
-
-        if is_blue_sky: pot_level = 4
-        elif upside_potential >= 30: pot_level = 3
-        elif upside_potential >= 15: pot_level = 2
-        elif upside_potential >= 5: pot_level = 1
-        else: pot_level = 0
-
-        max_stars = 5 if deviation <= 10.0 else 4 if deviation <= 20.0 else 3
-        raw_stars = pot_level + 1
-        final_stars = min(raw_stars, max_stars)
-        star_rating = "★" * final_stars + "☆" * (5 - final_stars)
-
-        if raw_stars > final_stars:
-            if final_stars == 4:
-                patterns = [
-                    ("【上昇トレンド・高値警戒】", "上値の壁は薄いものの、直近底値からの上昇が続いており、新規参入は短期目線での対応が無難な水準です。"),
-                    ("【モメンタム継続・押し目待ち】", "強い勢いを保っていますが、やや過熱感が出てきました。リスクを抑えるなら押し目を待つのが一案です。"),
-                    ("【高値圏の順張り局面】", "上値余地はありますが、すでに一定の上昇を遂げています。利益確定売りに警戒しつつの判断が求められます。")
-                ]
-            else:
-                patterns = [
-                    ("【高値圏のモメンタム相場】", "上値を抑える壁はなく強いトレンドですが、乖離率が高く高値掴みのリスクがあります。短期戦と割り切った対応が求められる水準です。"),
-                    ("【急騰後・リスクリワード低下】", "勢いは非常に強いものの、今からの新規エントリーはリスクとリターンのバランスが取りにくくなっています。慎重な判断が必要です。"),
-                    ("【過熱気味の上昇波】", "上値余地を残しつつも、テクニカル的には過熱感が漂います。無理に深追いせず、冷静に状況を見極めたい局面です。")
-                ]
-        else:
-            if pot_level == 4:
-                patterns = [
-                    ("【青天井モード】", "上値に目立った需給の壁（抵抗線）がなく、売り手が不在の真空地帯に突入しています。"),
-                    ("【上値抵抗クリア】", "過去の重いしこり玉（含み損）エリアを突破しており、需給が好転している局面です。"),
-                    ("【真空地帯への突入】", "目立った戻り売り圧力が少なく、トレンドに逆らわない順張りが有効な水準です。"),
-                    ("【売り手不在の快晴】", "上値での迷いが生じにくく、資金流入がストレートに株価に反映されやすい帯域にいます。"),
-                    ("【需給良好・上値追い】", "過去の取引の壁を抜けました。ただし、急ピッチな上昇時は利食いにも留意してください。"),
-                    ("【視界良好チャート】", "上値を抑えつける強固な壁が見当たりません。資金の逃げ足にだけ注意して波に乗りたい位置です。")
-                ]
-            elif pot_level == 3:
-                patterns = [
-                    ("【大幅な上値余地】", "強固な抵抗線まで距離があり、大きな値幅取りが狙えるポテンシャルを秘めています。"),
-                    ("【上値余地：特大】", "最大の壁まで十分な空間が開いており、大口の仕掛けが入りやすいエリアです。"),
-                    ("【リバウンド妙味】", "上値の重い水準まで距離があるため、反発トレンドに乗れた際のリターンが大きくなりやすい形状です。"),
-                    ("【ターゲット遠方】", "主要なヤレヤレ売りが降ってくる水準まで、軽快な足取りが期待できます。"),
-                    ("【絶好の上昇空間】", "次の大きな節目まで邪魔する壁がなく、買い圧力が素直に効きやすいチャートです。"),
-                    ("【値幅取り期待ゾーン】", "出来高の壁まで距離的余裕があり、トレンド発生時の爆発力に期待が持てる位置取りです。")
-                ]
-            elif pot_level == 2:
-                patterns = [
-                    ("【堅実な上値余地】", "次の抵抗帯まで適度な距離があり、セオリー通りの着実な上昇が見込めます。"),
-                    ("【上値余地：中】", "極端な遠さではありませんが、壁に到達するまで十分に利益を狙える水準にあります。"),
-                    ("【標準的なターゲット】", "最も分厚い出来高の壁に向けて、じわじわと水準を切り上げる展開が期待されます。"),
-                    ("【ステップアップ局面】", "まずは直上の壁を目標に、資金の流入に伴って堅調に推移しやすい位置です。"),
-                    ("【適度な空間】", "壁までの距離感として「ちょうど狙いやすい」位置取り。押し目があれば拾いたい形状です。"),
-                    ("【トレンド追従向きの局面】", "上値抵抗までの道のりは見えており、無理のない範囲で波に乗るのが有効な局面です。")
-                ]
-            elif pot_level == 1:
-                patterns = [
-                    ("【抵抗帯接近】", "すぐ上に出来高の壁が迫っています。ここを突破できるかが目先の最大の焦点となります。"),
-                    ("【激戦区への突入】", "過去の取引が密集するエリアが間近です。売り買いが交錯しやすく、乱高下に注意が必要です。"),
-                    ("【上値の壁テスト】", "分厚い壁へのアタック局面。跳ね返されるリスクも考慮し、打診買いから入りたい水準です。"),
-                    ("【ブレイク前夜警戒】", "すぐ上の抵抗線を明確に上抜ければ景色が一変しますが、現状はまだ重い壁の下に位置しています。"),
-                    ("【上値余地：小】", "ターゲットまでの距離が短く、ここから新規で大きな値幅を狙うにはややリスクが伴う位置です。"),
-                    ("【壁打ち反落リスク】", "壁にぶつかって反落する「壁打ち」になりやすい位置。突破を確認してからの参戦でも遅くありません。")
-                ]
-            else:
-                patterns = [
-                    ("【頭打ち警戒】", "現在値のすぐ上に強烈なしこり玉が大量待機しており、上値が極めて重い状態です。"),
-                    ("【岩盤到達・上値重し】", "過去最大の出来高を記録した価格帯に突入しています。大量の戻り売りを消化する莫大なパワーが必要です。"),
-                    ("【ヤレヤレ売り集中エリア】", "「買値に戻ったら売ろう」と待っていた投資家の売りが降り注ぐ、最も苦しい価格帯です。"),
-                    ("【上値抵抗MAX】", "需給面での障壁が一番高いエリアです。好材料などの強力なエンジンがない限り、突破は困難です。"),
-                    ("【ブレイクアウト待ちが一案】", "この分厚い壁の中での勝負は分が悪いです。明確に上抜けて真空地帯に入るのを待つのが賢明です。"),
-                    ("【撤退ラインの徹底が重要】", "壁に跳ね返されて急落するリスクが高い水準です。保有している場合は利益確定も視野に入る位置と言えます。")
-                ]
-
-        selected_pattern = random.choice(patterns)
-        star_desc = selected_pattern[0]
-        base_logic = selected_pattern[1]
-
-        flavor_logic = ""
-        if cap_category == "large": flavor_logic = "時価総額が巨大なため値動きは重めですが、機関投資家や外国人投資家の資金流入をエンジンとした、強力で重厚なトレンドが期待できます。"
-        elif cap_category == "target": flavor_logic = "中小型株として大口資金が最も好む規模感であり、資金が投下されれば一気に株価が動意づく（または壁を突破する）ポテンシャルを秘めています。"
-        else: flavor_logic = "※ただし時価総額が小さすぎるため、プロは資金を入れづらい銘柄です。主に個人投資家による短期的な値幅取りの対象（乱高下）になりやすいため、リスク管理を徹底してください。"
-
-        star_logic = base_logic + "<br><br>" + flavor_logic
-
-        past_1y = hist[-250:]
-        year_high = past_1y['High'].max()
-        year_low = past_1y['Low'].min()
-        position_score = 0.5
-        if year_high != year_low:
-            position_score = (current_price - year_low) / (year_high - year_low)
-            
-        has_dna = check_dna(hist)
-        vol_ratio = current_vol / avg_vol_100 if avg_vol_100 > 0 else 0
-        
-        is_platinum = 500 <= market_cap_oku <= 2000
-        is_magma = vol_ratio >= 1.5
-
-        safe_judgment, safe_explain = "", ""
-        if deviation <= -5.0:
-            safe_judgment = "📉 割安：底値仕込みが適切とされるゾーン（任意）"
-            safe_explain = "現在値が需給の壁より下に位置する「割安圏」です。直近底値（青の点線）を割ったら撤退というルールで、安値で仕込めるチャンスと言えます。"
-        elif deviation <= 0.0:
-            safe_judgment = "⚔️ 激戦：ブレイク前夜期待"
-            safe_explain = "分厚い需給の壁へのアタック目前です。ここを明確に上抜ければ一気に青空が広がる激戦区と位置付けられます。"
-        elif deviation <= 10.0:
-            safe_judgment = "🚀 安全圏：トレンド初動かも！？"
-            safe_explain = "需給の壁を突破したばかりで、最も素直に上昇の波に乗りやすいベストタイミングになりやすい水準です。"
-        elif deviation <= 20.0:
-            safe_judgment = "⚠️ 警戒：短期過熱気味警戒レベル"
-            safe_explain = "壁の突破から一定の上昇をしており少し離れすぎました。壁付近までの「押し目（下落）」を待つのが無難です。"
-        else:
-            safe_judgment = "💀 高度な警戒：高値掴みリスク大"
-            safe_explain = "壁から完全に乖離した超高値圏です。今から飛び乗るのは極めて危険で、上級者でも難しいゾーンのため注意必須です。"
-
-        intervention_score = 0
-        if is_platinum: intervention_score += 35
-        elif 100 <= market_cap_oku <= 5000: intervention_score += 15
-        if vol_ratio >= 3.0: intervention_score += 40
-        elif vol_ratio >= 1.5: intervention_score += 25
-        if position_score <= 0.2: intervention_score += 15
-        if has_dna: intervention_score += 10
-        
-        intervention_score = int(round(min(intervention_score, 100) / 10.0)) * 10
-        intervention_score = max(10, min(intervention_score, 90))
-        
-        intervention_comment = ""
-        if intervention_score >= 80: intervention_comment = "🚨 【極めて濃厚】大規模な資金流入のシグナルが点灯しています。"
-        elif intervention_score >= 50: intervention_comment = "👀 【予兆あり】平常時とは異なる資金の動きが観測されています。"
-        else: intervention_comment = "💤 【静観】現在は目立った資金流入の動きは検出されていません。"
-
-        base_rank = "D"
-        if intervention_score >= 80 and (is_blue_sky or upside_potential >= 30): base_rank = "S"
-        elif intervention_score >= 70: base_rank = "A"
-        elif intervention_score >= 50 or (is_platinum and position_score <= 0.5): base_rank = "B"
-        else: base_rank = "C"
-
-        warning_text = "【注意】※安全性を要確認" if deviation > 20 else ""
-
-        icons_list = []
-        if has_dna: icons_list.append("🧬")
-        if is_platinum: icons_list.append("💎")
-        if is_magma: icons_list.append("🦅")
-        icons_str = " ".join(icons_list)
-
-        return {
-            "コード": code_only, "銘柄名": jp_name, "現在値": int(current_price),
-            "時価総額": market_cap_oku, "時価総額_表示": formatted_mcap, "dividend_text": dividend_text,
-            "turnover_str": turnover_str, "ランク": base_rank, "警告": warning_text,
-            "乖離率": deviation, "hist": hist, "max_vol_price": max_vol_price,
-            "recent_20_low": recent_20_low, "star_rating": star_rating, "star_desc": star_desc,
-            "star_logic": star_logic, "intervention_name": intervention_name,
-            "intervention_score": intervention_score, "intervention_comment": intervention_comment,
-            "safe_judgment": safe_judgment, "safe_explain": safe_explain, "icons_str": icons_str
-        }
-    except: return None
+        return _evaluate_stock_cached(ticker)
+    except Exception:
+        # データ取得失敗時（制限に引っかかった時など）は None を返し、次回はキャッシュを使わず再取得に挑戦する
+        return None
 
 def draw_chart(row):
     hist_data = row['hist'].tail(150)
@@ -1248,7 +1278,7 @@ def show_main_page():
                                 draw_chart(diag_data)
                         else: 
                             # 🚨 ここが確実に表示されるように修正
-                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。（存在しない銘柄、または上場直後でデータが不足しています）")
+                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。\n\n※存在しない銘柄、または**アクセス集中による一時的な通信制限**の可能性があります。しばらく時間を空けてから再度お試しください。")
 
     # ==========================================
     # タブ3: 通知設定
