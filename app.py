@@ -795,7 +795,12 @@ def evaluate_stock(ticker):
 def evaluate_stock(ticker):
     try:
         return _evaluate_stock_cached(ticker)
-    except Exception:
+    except Exception as e:
+        # 💡 【変更箇所】エラーを握りつぶさず、画面に赤いエラーログを直接表示させる
+        import traceback
+        import streamlit as st
+        st.error(f"【デバッグ】{ticker} 内部エラーの正体:\n{traceback.format_exc()}")
+        
         # データ取得失敗時（制限に引っかかった時など）は None を返し、次回はキャッシュを使わず再取得に挑戦する
         return None
 
