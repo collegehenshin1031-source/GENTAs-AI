@@ -542,15 +542,12 @@ def format_market_cap(oku_val):
         return f"{cho}兆円" if oku == 0 else f"{cho}兆{oku}億円"
     return f"{oku_val}億円"
 
-# 🚨 【呼び出し元関数】エラー時はキャッシュせずに例外を受け流す
-def evaluate_stock(ticker):
-    try:
-        return _evaluate_stock_cached(ticker)
-    except Exception as e:
-        # 💡 【変更】サイレントエラーを防ぎ、画面にエラーの正体を可視化する
-        import traceback
-        st.error(f"【デバッグ用】{ticker} 取得エラー:\n{traceback.format_exc()}")
-        return None
+# 🚨 【エラー回避＆キャッシュ対策】の内部関数（データ取得失敗時は例外を投げてキャッシュさせない）
+@st.cache_data(ttl=900, show_spinner=False)
+def _evaluate_stock_cached(ticker):
+    # 💡 【変更】偽装セッションを外し、標準のyfinanceの通信ロジックに任せる
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period="2y")
     
     # 少ない日数や取得失敗（アクセス集中等）時は例外を出してキャッシュ化を回避する
     if hist.empty or len(hist) < 5: 
