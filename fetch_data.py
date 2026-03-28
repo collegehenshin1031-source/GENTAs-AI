@@ -9,8 +9,10 @@ HAGETAKA SCOPE - 日次候補抽出（GitHub Actions用）
 - all_data: 参考（時価総額フィルタ済み）
 """
 
+import io
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 import time
@@ -18,6 +20,7 @@ import time
 import numpy as np
 import pandas as pd
 import pytz
+import requests
 import yfinance as yf
 
 
@@ -1217,12 +1220,82 @@ TICKER_NAMES = {
 MIDCAP_TICKERS = list(TICKER_NAMES.keys())
 
 
+def get_jpx_data():
+    try:
+        html_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        response = requests.get(html_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        match = re.search(r'href="([^"]+data_j\.xls)"', response.text)
+        if not match:
+            return {}
+
+        file_url = "https://www.jpx.co.jp" + match.group(1)
+        xls_response = requests.get(file_url, headers=headers, timeout=10)
+        xls_response.raise_for_status()
+
+        df = pd.read_excel(io.BytesIO(xls_response.content))
+        df_tickers = df[df.iloc[:, 3].isin(["プライム", "スタンダード", "グロース"])]
+
+        def safe_code(x):
+            if pd.isnull(x):
+                return ""
+            s = str(x).strip()
+            if s.endswith(".0"):
+                return s[:-2]
+            return s
+
+        codes = df_tickers.iloc[:, 1].apply(safe_code)
+        return dict(zip(codes, df_tickers.iloc[:, 2]))
+    except Exception:
+        return {}
+
+JPX_NAME_MAP = get_jpx_data()
+
+
+def fetch_yahoo_japan_name(ticker: str) -> str | None:
+    code_only = str(ticker or "").replace(".T", "").strip()
+    if not code_only:
+        return None
+
+    try:
+        url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
+        res = requests.get(url_yfjp, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        res.raise_for_status()
+        match = re.search(r"<title>(.+?)(?:\(株\))?【", res.text)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        return None
+
+    return None
+
+
 def get_japanese_name(ticker: str, api_name: str | None = None) -> str:
-    if ticker in TICKER_NAMES:
-        return TICKER_NAMES[ticker]
-    if api_name:
-        return api_name
-    return ticker.replace(".T", "")
+    code_only = str(ticker or "").replace(".T", "").strip()
+
+    candidates = [
+        JPX_NAME_MAP.get(code_only),
+        TICKER_NAMES.get(ticker),
+        fetch_yahoo_japan_name(ticker),
+        api_name,
+    ]
+
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+        if re.search(r"[ぁ-んァ-ヶ一-龠々ー]", cand):
+            return cand
+        if cand in {"SHIFT", "TOWA", "ZOZO", "HENNGE", "GENDA", "MonotaRO", "Appier", "BASE", "JTOWER", "Sansan", "Macbee Planet", "KLab", "LTS", "PR TIMES", "JIG-SAW"}:
+            return cand
+
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if cand:
+            return cand
+
+    return code_only
 
 
 def calculate_flow_score(df: pd.DataFrame) -> dict:
