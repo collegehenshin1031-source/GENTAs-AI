@@ -379,9 +379,20 @@ def get_logo_base64():
 @st.cache_data(ttl=60)
 def load_data() -> Dict:
     p = Path("data/ratios.json")
-    if p.exists():
-        with open(p, "r", encoding="utf-8") as f: return json.load(f)
-    return {}
+    if not p.exists():
+        return {}
+
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    for bucket in ("data", "all_data"):
+        bucket_data = data.get(bucket, {}) or {}
+        if isinstance(bucket_data, dict):
+            for ticker, item in bucket_data.items():
+                if isinstance(item, dict):
+                    item["name"] = get_display_japanese_name(ticker, item.get("name"))
+
+    return data
 
 def get_fernet() -> Fernet: return Fernet(st.secrets["encryption"]["key"].encode())
 def encrypt_password(pw: str) -> str: return get_fernet().encrypt(pw.encode()).decode() if pw else ""
@@ -512,6 +523,47 @@ TICKER_NAMES_JP = {
     "4054.T": "日本情報クリエイト", "6095.T": "メドピア", "4436.T": "ミンカブ", "4477.T": "BASE",
 }
 
+
+def get_display_japanese_name(ticker: str, fallback_name: str | None = None, info: dict | None = None) -> str:
+    code_only = str(ticker or "").replace(".T", "").strip()
+    fallback_name = (fallback_name or "").strip()
+    info = info or {}
+
+    candidates = [
+        jpx_names.get(code_only),
+        TICKER_NAMES_JP.get(ticker),
+        fallback_name,
+        info.get("shortName"),
+        info.get("longName"),
+    ]
+
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if not cand:
+            continue
+        if re.search(r"[ぁ-んァ-ヶ一-龠々ー]", cand):
+            return cand
+        if cand in {"SHIFT", "TOWA", "ZOZO", "HENNGE", "GENDA", "MonotaRO", "Appier", "BASE", "JTOWER", "Sansan", "Macbee Planet", "KLab", "LTS"}:
+            return cand
+
+    try:
+        url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
+        res_yfjp = yf_session.get(url_yfjp, timeout=3)
+        match = re.search(r"<title>(.+?)(?:\(株\))?【", res_yfjp.text)
+        if match:
+            title_name = match.group(1).strip()
+            if title_name:
+                return title_name
+    except Exception:
+        pass
+
+    for cand in candidates:
+        cand = (cand or "").strip()
+        if cand:
+            return cand
+
+    return code_only or str(ticker or "")
+
 # 🌟 全角半角・スペース・改行・大文字小文字をすべて吸収してコードを抽出する関数
 def normalize_input(input_text):
     if not input_text: return []
@@ -588,17 +640,7 @@ def _evaluate_stock_cached(ticker):
         dividend_text = "無配"
 
     code_only = ticker.replace(".T", "")
-    jp_name = jpx_names.get(code_only)
-    if not jp_name or re.search(r'[a-zA-Z]', jp_name):
-        try:
-            url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-            # JP名前取得用にも偽装セッションを使用
-            res_yfjp = yf_session.get(url_yfjp, timeout=3)
-            match = re.search(r'<title>(.+?)(?:\(株\))?【', res_yfjp.text)
-            if match: jp_name = match.group(1).strip()
-            else: jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
-        except:
-            jp_name = info.get('longName', TICKER_NAMES_JP.get(ticker, ticker))
+    jp_name = get_display_japanese_name(ticker, info=info)
 
     if market_cap_oku >= 5000:
         cap_category = "large"
@@ -855,7 +897,7 @@ def render_card(ticker: str, d: Dict):
     
     code_only = ticker.replace(".T", "")
     url = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-    name_jp = TICKER_NAMES_JP.get(ticker, d.get('name', code_only))
+    name_jp = get_display_japanese_name(ticker, d.get('name'))
 
     tags_html = ""
     for tag in tags[:4]:
