@@ -22,6 +22,7 @@ HAGETAKA SCOPE - M&A候補検知ツール
 
 import json
 import re
+import ast
 import smtplib
 import io
 import requests
@@ -482,28 +483,78 @@ def get_jpx_data():
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(html_url, headers=headers, timeout=10)
         response.raise_for_status()
-        match = re.search(r'href="([^"]+data_j\.xls)"', response.text)
-        if not match: return {}, []
+
+        match = re.search(r'href="([^"]+data_j\.(?:xls|xlsx|csv))"', response.text, flags=re.IGNORECASE)
+        if not match:
+            return {}, []
+
         file_url = "https://www.jpx.co.jp" + match.group(1)
-        xls_response = requests.get(file_url, headers=headers, timeout=10)
-        xls_response.raise_for_status()
-        df = pd.read_excel(io.BytesIO(xls_response.content))
-        df_tickers = df[df.iloc[:, 3].isin(['プライム', 'スタンダード', 'グロース'])]
-        
-        # 🌟 英字入りコード対応のためのパース処理
+        file_response = requests.get(file_url, headers=headers, timeout=15)
+        file_response.raise_for_status()
+
+        if file_url.lower().endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(file_response.content), encoding="utf-8")
+        else:
+            df = pd.read_excel(io.BytesIO(file_response.content))
+
+        if df is None or df.empty or len(df.columns) < 3:
+            return {}, []
+
+        df = df.copy()
+        market_col = df.columns[3] if len(df.columns) >= 4 else None
+
+        if market_col is not None:
+            market_series = df[market_col].astype(str)
+            market_mask = market_series.str.contains("プライム|スタンダード|グロース", na=False)
+            df_tickers = df[market_mask].copy()
+            if df_tickers.empty:
+                df_tickers = df.copy()
+        else:
+            df_tickers = df.copy()
+
         def safe_code(x):
-            if pd.isnull(x): return ""
-            s = str(x).strip()
-            if s.endswith('.0'): return s[:-2]
+            if pd.isnull(x):
+                return ""
+            s = str(x).strip().upper()
+            if s.endswith(".0"):
+                s = s[:-2]
             return s
-            
+
         codes = df_tickers.iloc[:, 1].apply(safe_code)
-        name_map = dict(zip(codes, df_tickers.iloc[:, 2]))
+        names = df_tickers.iloc[:, 2].astype(str).str.strip()
+
+        name_map = {}
+        for code, name in zip(codes, names):
+            if code and name and name.lower() != "nan":
+                name_map[code] = name
+
         return name_map, list(name_map.keys())
     except Exception:
         return {}, []
 
+
+@st.cache_data(ttl=86400)
+def load_local_ticker_name_master():
+    """fetch_data.py の固定辞書を安全に読み込んで表示側でも使う"""
+    try:
+        fetch_data_path = Path(__file__).resolve().parent / "fetch_data.py"
+        src = fetch_data_path.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "TICKER_NAMES":
+                        value = ast.literal_eval(node.value)
+                        if isinstance(value, dict):
+                            return {str(k).strip(): str(v).strip() for k, v in value.items()}
+        return {}
+    except Exception:
+        return {}
+
+
 jpx_names, jpx_codes = get_jpx_data()
+LOCAL_TICKER_MASTER = load_local_ticker_name_master()
 
 TICKER_NAMES_JP = {
     "3923.T": "ラクス", "4443.T": "Sansan", "4478.T": "フリー", "3994.T": "マネーフォワード",
@@ -525,13 +576,22 @@ TICKER_NAMES_JP = {
 
 
 def get_display_japanese_name(ticker: str, fallback_name: str | None = None, info: dict | None = None) -> str:
-    code_only = str(ticker or "").replace(".T", "").strip()
+    code_only = str(ticker or "").replace(".T", "").strip().upper()
+    ticker_key = f"{code_only}.T" if code_only else str(ticker or "").strip().upper()
     fallback_name = (fallback_name or "").strip()
     info = info or {}
 
+    allowed_brand_names = {
+        "SHIFT", "TOWA", "ZOZO", "HENNGE", "GENDA", "MonotaRO", "Appier",
+        "BASE", "JTOWER", "Sansan", "Macbee Planet", "KLab", "LTS", "PR TIMES",
+        "THECOO", "WACUL", "CRI・ミドルウェア", "eBASE", "NOK", "NTN", "THK",
+        "TPR", "IHI", "SUBARU", "KYB"
+    }
+
     candidates = [
         jpx_names.get(code_only),
-        TICKER_NAMES_JP.get(ticker),
+        LOCAL_TICKER_MASTER.get(ticker_key),
+        TICKER_NAMES_JP.get(ticker_key),
         fallback_name,
         info.get("shortName"),
         info.get("longName"),
@@ -543,7 +603,7 @@ def get_display_japanese_name(ticker: str, fallback_name: str | None = None, inf
             continue
         if re.search(r"[ぁ-んァ-ヶ一-龠々ー]", cand):
             return cand
-        if cand in {"SHIFT", "TOWA", "ZOZO", "HENNGE", "GENDA", "MonotaRO", "Appier", "BASE", "JTOWER", "Sansan", "Macbee Planet", "KLab", "LTS"}:
+        if cand in allowed_brand_names:
             return cand
 
     try:
