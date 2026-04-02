@@ -27,6 +27,8 @@ import ast
 import smtplib
 import io
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import random
 import time
 import unicodedata
@@ -40,10 +42,9 @@ import pytz
 import base64
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-
-from market_fetch import fetch_ohlcv_and_info_robust, get_yf_session
 
 # Google Sheets連携
 from streamlit_gsheets import GSheetsConnection
@@ -67,6 +68,37 @@ LEVEL_COLORS = {4: "#C41E3A", 3: "#FF9800", 2: "#FFC107", 1: "#5C6BC0", 0: "#9E9
 
 MASTER_PASSWORD = "88888"
 DISCLAIMER_TEXT = "本ツールは市場データの可視化を目的とした補助ツールです。<br>銘柄推奨・売買助言ではありません。最終判断は利用者ご自身で行ってください。"
+
+# ==========================================
+# 【最強の通信セッション構築】
+# ==========================================
+# 複数のブラウザ（Chrome, Safari, Firefox等）の身分証を用意
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+]
+
+def get_yf_session():
+    """Bot弾きを回避し、弾かれても自動リトライするセッションを作成"""
+    session = requests.Session()
+    # 429(Too Many Requests)や50xエラー時に、最大5回まで間隔を空けて自動リトライ
+    retries = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
+    # 一般的なブラウザからのアクセスにランダムで偽装し、人間らしいヘッダーを付与
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.7,en;q=0.3",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1"
+    })
+    return session
+
+yf_session = get_yf_session()
 
 # ==========================================
 # カート操作のコールバック関数（即時反映用）
@@ -589,7 +621,7 @@ def get_display_japanese_name(
     if allow_yahoo_fallback:
         try:
             url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-            res_yfjp = get_yf_session().get(url_yfjp, timeout=3)
+            res_yfjp = yf_session.get(url_yfjp, timeout=3)
             match = re.search(r"<title>(.+?)(?:\(株\))?【", res_yfjp.text)
             if match:
                 title_name = match.group(1).strip()
@@ -706,9 +738,75 @@ def _build_hist_from_cache(ticker: str, history_data: dict):
         return None
 
 
+def _fetch_stooq_hist_jp(ticker: str) -> pd.DataFrame | None:
+    """yfinance が空になる東証英字銘柄（151A 等）向け。Stooq 日足（例: 151a.jp）。"""
+    code = str(ticker or "").replace(".T", "").strip()
+    if not code:
+        return None
+    sym = f"{code.lower()}.jp"
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        r = requests.get(url, timeout=25)
+        r.raise_for_status()
+        raw = r.text.strip()
+        if not raw or raw.lower().startswith("no data"):
+            return None
+        df = pd.read_csv(io.StringIO(raw))
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    colmap = {str(c).strip(): str(c).strip() for c in df.columns}
+    df = df.rename(columns=colmap)
+    lower = {c.lower(): c for c in df.columns}
+    def col(name: str) -> str | None:
+        return lower.get(name.lower())
+    dcol, ocol, hcol, lcol, ccol, vcol = (
+        col("date"), col("open"), col("high"), col("low"), col("close"), col("volume")
+    )
+    if not all([dcol, ocol, hcol, lcol, ccol]):
+        return None
+    vol_series = (
+        pd.to_numeric(df[vcol], errors="coerce").fillna(0)
+        if vcol
+        else pd.Series(0.0, index=df.index)
+    )
+    out = pd.DataFrame({
+        "Open": pd.to_numeric(df[ocol], errors="coerce"),
+        "High": pd.to_numeric(df[hcol], errors="coerce"),
+        "Low": pd.to_numeric(df[lcol], errors="coerce"),
+        "Close": pd.to_numeric(df[ccol], errors="coerce"),
+        "Volume": vol_series,
+    })
+    out.index = pd.to_datetime(df[dcol], errors="coerce")
+    out = out[~out.index.isna()].dropna(subset=["Close"], how="any").sort_index()
+    out = out.tail(520)
+    if len(out) < 5:
+        return None
+    out["Volume"] = out["Volume"].fillna(0)
+    return out
+
+
 def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: float = 5.0):
-    """Stooq優先（東証・英字銘柄）→ yfinance。infoは別経路で取得しYahoo負荷を分散。"""
-    return fetch_ohlcv_and_info_robust(ticker, max_yf_retries=max_retries, base_delay=base_delay)
+    """yfinanceからデータをリトライ付きで取得（案1+案2: セッション渡し＋exponential backoff）"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            session = get_yf_session()
+            stock = yf.Ticker(ticker, session=session)
+            hist = stock.history(period="2y")
+            if hist is None or hist.empty or len(hist) < 5:
+                raise ValueError("データが空または不十分です")
+            info = stock.info or {}
+            return hist, info
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    hist_sq = _fetch_stooq_hist_jp(ticker)
+    if hist_sq is not None and len(hist_sq) >= 5:
+        return hist_sq, {}
+    raise last_error if last_error else ValueError("データ取得に失敗しました")
 
 
 # 🚨 【エラー回避＆キャッシュ対策】の内部関数（データ取得失敗時は例外を投げてキャッシュさせない）
@@ -739,10 +837,8 @@ def _evaluate_stock_cached(ticker):
     shares = info.get('sharesOutstanding') or 0
     if market_cap == 0: market_cap = current_price * shares
     market_cap_oku = market_cap / 100000000
-
+    
     formatted_mcap = format_market_cap(market_cap_oku)
-    if (not info.get("marketCap")) and (not info.get("sharesOutstanding")) and market_cap_oku <= 0:
-        formatted_mcap = "―（リアルタイム未取得・制限の可能性）"
 
     turnover_rate = (current_vol / shares) * 100 if shares > 0 and current_vol > 0 else 0
         
