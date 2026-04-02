@@ -810,7 +810,12 @@ def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: flo
             hist = stock.history(period="2y")
             if hist is None or hist.empty or len(hist) < 5:
                 raise ValueError("データが空または不十分です")
-            info = stock.info or {}
+            # hist が取れた後の info は別途。info だけ失敗すると履歴まで無駄に捨てていた（151A 等で頻発しうる）
+            info = {}
+            try:
+                info = stock.info or {}
+            except Exception:
+                pass
             return hist, info
         except Exception as e:
             last_error = e
@@ -841,6 +846,8 @@ def _evaluate_stock_cached(ticker):
 
     current_price = safe_float(hist['Close'].iloc[-1], 0.0)
     current_vol = safe_float(hist['Volume'].iloc[-1], 0.0)
+    if current_price <= 0:
+        raise ValueError("株価データが無効です（終値0以下）")
 
     # 少ない日数でも計算できるように修正
     avg_vol_100 = safe_float(hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean(), 0.0)
@@ -888,15 +895,19 @@ def _evaluate_stock_cached(ticker):
 
     hist_6mo = hist.tail(125)
     
-    # 価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ
+    # 価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ（duplicates で非一意ビンも回避）
     if hist_6mo['Close'].nunique() > 1:
-        price_bins = pd.cut(hist_6mo['Close'], bins=15)
-        vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
         try:
+            price_bins = pd.cut(hist_6mo['Close'], bins=15, duplicates="drop")
+            vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
             max_vol_price = vol_profile.idxmax().mid
         except Exception:
             max_vol_price = current_price
     else:
+        max_vol_price = current_price
+
+    max_vol_price = safe_float(max_vol_price, current_price)
+    if max_vol_price <= 0 or np.isnan(max_vol_price):
         max_vol_price = current_price
         
     recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
@@ -909,7 +920,11 @@ def _evaluate_stock_cached(ticker):
     else:
         upside_potential = ((max_vol_price - current_price) / current_price) * 100
 
-    deviation = ((current_price - max_vol_price) / max_vol_price) * 100
+    deviation = (
+        ((current_price - max_vol_price) / max_vol_price) * 100
+        if max_vol_price > 0
+        else 0.0
+    )
 
     if is_blue_sky: pot_level = 4
     elif upside_potential >= 30: pot_level = 3
@@ -1078,10 +1093,23 @@ def draw_chart(row, chart_key: str | None = None):
     
     bins = 15
     hist_data_copy = hist_data.copy()
-    hist_data_copy['price_bins'] = pd.cut(hist_data_copy['Close'], bins=bins)
-    vol_profile = hist_data_copy.groupby('price_bins', observed=False)['Volume'].sum()
-    bin_centers = [b.mid for b in vol_profile.index]
-    bin_volumes = vol_profile.values
+    # 値がほぼ一定の銘柄で pd.cut が「Bin edges must be unique」となり落ちるのを防ぐ
+    if hist_data_copy["Close"].nunique() <= 1:
+        mid = float(hist_data_copy["Close"].iloc[-1])
+        bin_centers = [mid]
+        bin_volumes = [float(hist_data_copy["Volume"].sum())]
+    else:
+        try:
+            hist_data_copy["price_bins"] = pd.cut(
+                hist_data_copy["Close"], bins=bins, duplicates="drop"
+            )
+            vol_profile = hist_data_copy.groupby("price_bins", observed=False)["Volume"].sum()
+            bin_centers = [b.mid for b in vol_profile.index]
+            bin_volumes = vol_profile.values
+        except Exception:
+            mid = float(hist_data_copy["Close"].iloc[-1])
+            bin_centers = [mid]
+            bin_volumes = [float(hist_data_copy["Volume"].sum())]
     
     fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.85, 0.15], horizontal_spacing=0)
     fig.add_trace(go.Candlestick(x=hist_data.index, open=hist_data['Open'], high=hist_data['High'], low=hist_data['Low'], close=hist_data['Close'], name="株価", showlegend=False), row=1, col=1)
