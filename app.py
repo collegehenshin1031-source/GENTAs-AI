@@ -20,6 +20,7 @@ HAGETAKA SCOPE - M&A候補検知ツール
 - 【究極防壁】ブラウザ偽装のランダム化と人間らしいヘッダー付与で長期間ブロックを極限回避
 """
 
+import hashlib
 import json
 import re
 import ast
@@ -656,12 +657,19 @@ def format_market_cap(oku_val):
     return f"{oku_val}億円"
 
 # ==========================================
-# 案5: バッチ保存済みOHLCVキャッシュ読み込み
+# 案5: バッチ保存済みOHLCVキャッシュ（64シャード + レガシー1ファイル）
+# fetch_data.HISTORY_SHARD_COUNT と同一であること
 # ==========================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_stock_history() -> dict:
-    """GitHub Actionsが毎日保存したstock_history.jsonを読み込む"""
-    p = Path("data/stock_history.json")
+HISTORY_SHARD_COUNT = 64
+
+
+def _history_shard_id(ticker: str) -> int:
+    return int(hashlib.md5(ticker.encode("utf-8")).hexdigest(), 16) % HISTORY_SHARD_COUNT
+
+
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
+def _load_history_shard(shard_id: int) -> dict:
+    p = Path(f"data/history/shard_{shard_id:02d}.json")
     if not p.exists():
         return {}
     try:
@@ -669,6 +677,35 @@ def load_stock_history() -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_stock_history_legacy_flat() -> dict:
+    """後方互換: 単一の stock_history.json（updated_at 等を除く）"""
+    p = Path("data/stock_history.json")
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        for k in ("updated_at", "format"):
+            data.pop(k, None)
+        return data
+    except Exception:
+        return {}
+
+
+def load_ticker_history_row(ticker: str) -> dict | None:
+    """診断用: 銘柄1件分のキャッシュ（シャード優先、無ければレガシー）"""
+    row = _load_history_shard(_history_shard_id(ticker)).get(ticker)
+    if row and row.get("dates"):
+        return row
+    legacy = _load_stock_history_legacy_flat().get(ticker)
+    if legacy and legacy.get("dates"):
+        return legacy
+    return None
 
 
 def _build_hist_from_cache(ticker: str, history_data: dict):
@@ -713,12 +750,11 @@ def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: flo
 @st.cache_data(ttl=900, show_spinner=False)
 def _evaluate_stock_cached(ticker):
     # 案5: バッチ保存済みのローカルデータを優先使用（Yahoo Financeへのアクセスを排除）
-    history_data = load_stock_history()
-    hist = _build_hist_from_cache(ticker, history_data)
+    row = load_ticker_history_row(ticker)
+    hist = _build_hist_from_cache(ticker, {ticker: row}) if row else None
 
     if hist is not None and len(hist) >= 5:
-        # ローカルキャッシュヒット（Yahoo Financeへのアクセスなし）
-        info = (history_data.get(ticker) or {}).get("info") or {}
+        info = (row.get("info") or {}) if row else {}
     else:
         # キャッシュミス: リトライ付きセッション経由でyfinanceから取得（案1+案2）
         hist, info = _fetch_yf_data_with_retry(ticker)
