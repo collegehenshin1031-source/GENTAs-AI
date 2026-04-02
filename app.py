@@ -1530,7 +1530,7 @@ def show_main_page():
         st.markdown("##### 🔍 気になる銘柄を入力")
         with st.form(key='search_form'):
             # 🌟 入力欄をコピペしやすくしつつ、高さを最小限に抑えて見た目を維持
-            input_code = st.text_area("銘柄コード", value=default_input, placeholder="例: 7011 7203 151A\n改行やスペース区切りで複数入力できます", label_visibility="collapsed", height=68)
+            input_code = st.text_area("銘柄コード", value=default_input, placeholder="例: 7011 7203\n改行やスペース区切りで複数入力できます", label_visibility="collapsed", height=68)
             search_btn = st.form_submit_button("🦅 ハゲタカAIで診断する")
             
         if search_btn and input_code:
