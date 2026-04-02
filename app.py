@@ -738,6 +738,55 @@ def _build_hist_from_cache(ticker: str, history_data: dict):
         return None
 
 
+def _fetch_stooq_hist_jp(ticker: str) -> pd.DataFrame | None:
+    """yfinance が空になる東証英字銘柄（151A 等）向け。Stooq 日足（例: 151a.jp）。"""
+    code = str(ticker or "").replace(".T", "").strip()
+    if not code:
+        return None
+    sym = f"{code.lower()}.jp"
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        r = requests.get(url, timeout=25)
+        r.raise_for_status()
+        raw = r.text.strip()
+        if not raw or raw.lower().startswith("no data"):
+            return None
+        df = pd.read_csv(io.StringIO(raw))
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    colmap = {str(c).strip(): str(c).strip() for c in df.columns}
+    df = df.rename(columns=colmap)
+    lower = {c.lower(): c for c in df.columns}
+    def col(name: str) -> str | None:
+        return lower.get(name.lower())
+    dcol, ocol, hcol, lcol, ccol, vcol = (
+        col("date"), col("open"), col("high"), col("low"), col("close"), col("volume")
+    )
+    if not all([dcol, ocol, hcol, lcol, ccol]):
+        return None
+    vol_series = (
+        pd.to_numeric(df[vcol], errors="coerce").fillna(0)
+        if vcol
+        else pd.Series(0.0, index=df.index)
+    )
+    out = pd.DataFrame({
+        "Open": pd.to_numeric(df[ocol], errors="coerce"),
+        "High": pd.to_numeric(df[hcol], errors="coerce"),
+        "Low": pd.to_numeric(df[lcol], errors="coerce"),
+        "Close": pd.to_numeric(df[ccol], errors="coerce"),
+        "Volume": vol_series,
+    })
+    out.index = pd.to_datetime(df[dcol], errors="coerce")
+    out = out[~out.index.isna()].dropna(subset=["Close"], how="any").sort_index()
+    out = out.tail(520)
+    if len(out) < 5:
+        return None
+    out["Volume"] = out["Volume"].fillna(0)
+    return out
+
+
 def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: float = 5.0):
     """yfinanceからデータをリトライ付きで取得（案1+案2: セッション渡し＋exponential backoff）"""
     last_error = None
@@ -754,6 +803,9 @@ def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: flo
             last_error = e
             if attempt < max_retries - 1:
                 time.sleep(base_delay * (2 ** attempt))
+    hist_sq = _fetch_stooq_hist_jp(ticker)
+    if hist_sq is not None and len(hist_sq) >= 5:
+        return hist_sq, {}
     raise last_error if last_error else ValueError("データ取得に失敗しました")
 
 
