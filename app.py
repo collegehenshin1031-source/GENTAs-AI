@@ -29,6 +29,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import random
+import time
 import unicodedata
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -654,23 +655,83 @@ def format_market_cap(oku_val):
         return f"{cho}兆円" if oku == 0 else f"{cho}兆{oku}億円"
     return f"{oku_val}億円"
 
+# ==========================================
+# 案5: バッチ保存済みOHLCVキャッシュ読み込み
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_stock_history() -> dict:
+    """GitHub Actionsが毎日保存したstock_history.jsonを読み込む"""
+    p = Path("data/stock_history.json")
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _build_hist_from_cache(ticker: str, history_data: dict):
+    """stock_history.jsonのデータからpandas DataFrameを復元"""
+    data = history_data.get(ticker)
+    if not data or not data.get("dates"):
+        return None
+    try:
+        hist = pd.DataFrame({
+            "Open":   data["O"],
+            "High":   data["H"],
+            "Low":    data["L"],
+            "Close":  data["C"],
+            "Volume": data["V"],
+        }, index=pd.to_datetime(data["dates"]))
+        hist.index.name = "Date"
+        return hist
+    except Exception:
+        return None
+
+
+def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: float = 5.0):
+    """yfinanceからデータをリトライ付きで取得（案1+案2: セッション渡し＋exponential backoff）"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            session = get_yf_session()
+            stock = yf.Ticker(ticker, session=session)
+            hist = stock.history(period="2y")
+            if hist is None or hist.empty or len(hist) < 5:
+                raise ValueError("データが空または不十分です")
+            info = stock.info or {}
+            return hist, info
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_error if last_error else ValueError("データ取得に失敗しました")
+
+
 # 🚨 【エラー回避＆キャッシュ対策】の内部関数（データ取得失敗時は例外を投げてキャッシュさせない）
 @st.cache_data(ttl=900, show_spinner=False)
 def _evaluate_stock_cached(ticker):
-    # 💡 【変更】偽装セッションを外し、標準のyfinanceの通信ロジックに任せる
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period="2y")
-    
-    # 少ない日数や取得失敗（アクセス集中等）時は例外を出してキャッシュ化を回避する
-    if hist.empty or len(hist) < 5: 
+    # 案5: バッチ保存済みのローカルデータを優先使用（Yahoo Financeへのアクセスを排除）
+    history_data = load_stock_history()
+    hist = _build_hist_from_cache(ticker, history_data)
+
+    if hist is not None and len(hist) >= 5:
+        # ローカルキャッシュヒット（Yahoo Financeへのアクセスなし）
+        info = (history_data.get(ticker) or {}).get("info") or {}
+    else:
+        # キャッシュミス: リトライ付きセッション経由でyfinanceから取得（案1+案2）
+        hist, info = _fetch_yf_data_with_retry(ticker)
+
+    # 取得失敗時は例外を出してキャッシュ化を回避する
+    if hist is None or hist.empty or len(hist) < 5:
         raise ValueError("Insufficient data or fetch limit")
 
     current_price = hist['Close'].iloc[-1]
     current_vol = hist['Volume'].iloc[-1]
-    
+
     # 少ない日数でも計算できるように修正
     avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
-    info = stock.info
     
     # yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
     market_cap = info.get('marketCap') or 0
@@ -894,13 +955,7 @@ def _evaluate_stock_cached(ticker):
 def evaluate_stock(ticker):
     try:
         return _evaluate_stock_cached(ticker)
-    except Exception as e:
-        # 💡 【変更箇所】エラーを握りつぶさず、画面に赤いエラーログを直接表示させる
-        import traceback
-        import streamlit as st
-        st.error(f"【デバッグ】{ticker} 内部エラーの正体:\n{traceback.format_exc()}")
-        
-        # データ取得失敗時（制限に引っかかった時など）は None を返し、次回はキャッシュを使わず再取得に挑戦する
+    except Exception:
         return None
 
 def draw_chart(row):
