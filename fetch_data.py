@@ -1463,9 +1463,10 @@ def determine_level(ma_score: float) -> int:
     return 0
 
 
-def fetch_volume_data(tickers: list[str], chunk_size: int = 20) -> tuple[dict, dict]:
+def fetch_volume_data(tickers: list[str], chunk_size: int = 10) -> tuple[dict, dict, dict]:
     results: dict = {}
     qualified: dict = {}
+    stock_history: dict = {}
     prev_streaks = load_previous_streaks()
     total = len(tickers)
     now_jst = datetime.now(JST)
@@ -1518,6 +1519,7 @@ def fetch_volume_data(tickers: list[str], chunk_size: int = 20) -> tuple[dict, d
                     shares_outstanding = None
                     shares_outstanding_is_estimated = False
                     stock = None
+                    info = {}
                     try:
                         stock = yf.Ticker(ticker)
                         info = stock.info or {}
@@ -1543,6 +1545,26 @@ def fetch_volume_data(tickers: list[str], chunk_size: int = 20) -> tuple[dict, d
                                     shares_outstanding = None
                     except Exception:
                         pass
+
+                    stock_history[ticker] = {
+                        "dates": [d.strftime("%Y-%m-%d") for d in df.index],
+                        "O": [round(float(v), 1) for v in df["Open"]],
+                        "H": [round(float(v), 1) for v in df["High"]],
+                        "L": [round(float(v), 1) for v in df["Low"]],
+                        "C": [round(float(v), 1) for v in df["Close"]],
+                        "V": [int(v) for v in df["Volume"]],
+                        "info": {
+                            "marketCap": info.get("marketCap"),
+                            "sharesOutstanding": info.get("sharesOutstanding"),
+                            "dividendRate": info.get("dividendRate"),
+                            "trailingAnnualDividendRate": info.get("trailingAnnualDividendRate"),
+                            "payoutRatio": info.get("payoutRatio"),
+                            "dividendYield": info.get("dividendYield"),
+                            "trailingAnnualDividendYield": info.get("trailingAnnualDividendYield"),
+                            "shortName": info.get("shortName"),
+                            "longName": info.get("longName"),
+                        },
+                    }
 
                     name = get_japanese_name(ticker, api_name)
                     in_range = (MARKET_CAP_MIN <= market_cap_oku <= MARKET_CAP_MAX)
@@ -1648,9 +1670,9 @@ def fetch_volume_data(tickers: list[str], chunk_size: int = 20) -> tuple[dict, d
         except Exception as e:
             print(f"  ❌ チャンク取得エラー: {e}")
 
-        time.sleep(1.5)
+        time.sleep(3)
 
-    return results, qualified
+    return results, qualified, stock_history
 
 
 def main():
@@ -1664,7 +1686,7 @@ def main():
     print(f"🎯 対象: 時価総額 {MARKET_CAP_MIN}億〜{MARKET_CAP_MAX}億円")
     print(f"📋 監視銘柄数: {len(MIDCAP_TICKERS)}")
 
-    results, qualified = fetch_volume_data(MIDCAP_TICKERS)
+    results, qualified, stock_history = fetch_volume_data(MIDCAP_TICKERS)
 
     filtered = {k: v for k, v in results.items() if v.get("in_cap_range")}
     # 並び：LEVEL→MAScore→FlowScore
@@ -1693,6 +1715,10 @@ def main():
     Path("data/ratios.json").write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
     print("💾 保存完了: data/ratios.json")
     print(f"🎯 候補: {len(sorted_qualified)} 件 / フィルタ通過: {len(filtered)} 件")
+
+    history_output = {"updated_at": updated_at, **stock_history}
+    Path("data/stock_history.json").write_text(json.dumps(history_output, ensure_ascii=False), encoding="utf-8")
+    print(f"💾 保存完了: data/stock_history.json ({len(stock_history)} 銘柄)")
 
 
 if __name__ == "__main__":
