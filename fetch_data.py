@@ -1295,18 +1295,20 @@ def get_jpx_data():
         xls_response = requests.get(file_url, headers=headers, timeout=10)
         xls_response.raise_for_status()
 
-        df = pd.read_excel(io.BytesIO(xls_response.content))
-        df_tickers = df[df.iloc[:, 3].isin(["プライム", "スタンダード", "グロース"])]
-
-        def safe_code(x):
-            if pd.isnull(x):
+        def _jpx_code_cell(v):
+            """Excel が数値化した銘柄（7203.0）と英字銘柄（151A）の両方を文字列で保持"""
+            if pd.isna(v):
                 return ""
-            s = str(x).strip()
-            if s.endswith(".0"):
+            s = str(v).strip()
+            if re.match(r"^\d+\.0$", s):
                 return s[:-2]
             return s
 
-        codes = df_tickers.iloc[:, 1].apply(safe_code)
+        df = pd.read_excel(io.BytesIO(xls_response.content))
+        df.iloc[:, 1] = df.iloc[:, 1].map(_jpx_code_cell)
+        df_tickers = df[df.iloc[:, 3].isin(["プライム", "スタンダード", "グロース"])]
+        codes = df_tickers.iloc[:, 1].astype(str).str.strip()
+        codes = codes[codes != ""]
         return dict(zip(codes, df_tickers.iloc[:, 2]))
     except Exception:
         return {}
