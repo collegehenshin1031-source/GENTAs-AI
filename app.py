@@ -659,12 +659,26 @@ def check_dna(hist):
     except:
         return False
 
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if np.isnan(v) or np.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
 def format_market_cap(oku_val):
-    oku_val = int(oku_val)
-    if oku_val >= 10000:
-        cho = oku_val // 10000
-        oku = oku_val % 10000
+    oku_val = safe_float(oku_val, 0.0)
+    oku_int = int(round(oku_val)) if oku_val > 0 else 0
+    if oku_int >= 10000:
+        cho = oku_int // 10000
+        oku = oku_int % 10000
         return f"{cho}兆円" if oku == 0 else f"{cho}兆{oku}億円"
+    return f"{oku_int}億円"
     return f"{oku_val}億円"
 
 # ==========================================
@@ -826,17 +840,17 @@ def _evaluate_stock_cached(ticker):
     if hist is None or hist.empty or len(hist) < 5:
         raise ValueError("Insufficient data or fetch limit")
 
-    current_price = hist['Close'].iloc[-1]
-    current_vol = hist['Volume'].iloc[-1]
+    current_price = safe_float(hist['Close'].iloc[-1], 0.0)
+    current_vol = safe_float(hist['Volume'].iloc[-1], 0.0)
 
     # 少ない日数でも計算できるように修正
-    avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
+    avg_vol_100 = safe_float(hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean(), 0.0)
     
-    # yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
-    market_cap = info.get('marketCap') or 0
-    shares = info.get('sharesOutstanding') or 0
-    if market_cap == 0: market_cap = current_price * shares
-    market_cap_oku = market_cap / 100000000
+    # yfinanceから欠損値(None / NaN / inf)が返ってきても安全に処理する
+    market_cap = safe_float(info.get('marketCap'), 0.0)
+    shares = safe_float(info.get('sharesOutstanding'), 0.0)
+    if market_cap <= 0 and current_price > 0 and shares > 0: market_cap = current_price * shares
+    market_cap_oku = safe_float(market_cap / 100000000, 0.0)
     
     formatted_mcap = format_market_cap(market_cap_oku)
 
@@ -1040,7 +1054,7 @@ def _evaluate_stock_cached(ticker):
     icons_str = " ".join(icons_list)
 
     return {
-        "コード": code_only, "銘柄名": jp_name, "現在値": int(current_price),
+        "コード": code_only, "銘柄名": jp_name, "現在値": int(round(current_price)) if current_price > 0 else 0,
         "時価総額": market_cap_oku, "時価総額_表示": formatted_mcap, "dividend_text": dividend_text,
         "turnover_str": turnover_str, "ランク": base_rank, "警告": warning_text,
         "乖離率": deviation, "hist": hist, "max_vol_price": max_vol_price,
@@ -1054,8 +1068,9 @@ def _evaluate_stock_cached(ticker):
 def evaluate_stock(ticker):
     try:
         return _evaluate_stock_cached(ticker)
-    except Exception:
-        return None
+    except Exception as e:
+        friendly_message = "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。\n\n上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
+        return {"_status": "insufficient", "_message": friendly_message, "_detail": str(e) if e else "", "_ticker": ticker}
 
 def draw_chart(row, chart_key: str | None = None):
     hist_data = row['hist'].tail(150)
@@ -1473,7 +1488,9 @@ def show_main_page():
                 with st.spinner(f'🦅 {len(codes)}銘柄を精密検査中...'):
                     for code in codes:
                         diag_data = evaluate_stock(f"{code}.T")
-                        if diag_data:
+                        if diag_data and diag_data.get("_status") == "insufficient":
+                            st.info(f"【 {code} 】\n\n{diag_data.get('_message', 'この銘柄は診断対象外です。')}")
+                        elif diag_data:
                             # 💡 診断結果をカードで囲んで区切りを明確に
                             with st.container():
                                 st.markdown('<div class="diagnosis-card-marker" style="display:none;"></div>', unsafe_allow_html=True)
