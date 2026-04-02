@@ -958,7 +958,7 @@ def evaluate_stock(ticker):
     except Exception:
         return None
 
-def draw_chart(row):
+def draw_chart(row, chart_key: str | None = None):
     hist_data = row['hist'].tail(150)
     max_vol_price = row['max_vol_price']
     recent_20_low = row['recent_20_low']
@@ -992,7 +992,13 @@ def draw_chart(row):
     fig.update_xaxes(fixedrange=True); fig.update_yaxes(fixedrange=True)
     fig.update_xaxes(showticklabels=False, row=1, col=2)
     
-    st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    if chart_key:
+        try:
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=chart_key)
+        except TypeError:
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+    else:
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
 
 def render_card(ticker: str, d: Dict):
     flow_score = d.get("flow_score", 0)
@@ -1388,7 +1394,7 @@ def show_main_page():
                                     
                                     st.markdown(rank_html, unsafe_allow_html=True)
                                     
-                                    with st.expander("💡 総合判定の基準を見る"):
+                                    with st.expander("💡 総合判定の基準を見る", key=f"diag_exp_rank_{code}"):
                                         st.markdown("""
                                         * **【Sランク】** 大口介入期待度80%以上 ＋ 上昇期待値(上値余地)30%以上
                                         * **【Aランク】** 大口介入期待度70%以上（強い資金流入シグナル）
@@ -1402,7 +1408,7 @@ def show_main_page():
                                     st.write(f"配当情報: **{diag_data['dividend_text']}**")
                                     st.write(f"商い熱量: **{diag_data['turnover_str']}**")
                                     
-                                    with st.expander("💡 商い熱量（株式回転率）とは？"):
+                                    with st.expander("💡 商い熱量（株式回転率）とは？", key=f"diag_exp_turnover_{code}"):
                                         st.markdown("""
                                         **商い熱量 ＝ 出来高が総発行株数の何％にあたるか（株式回転率）**
                                         この数値は、株価が動く「エネルギーの大きさ」を見極めるための重要なテクニカル指標です。
@@ -1417,7 +1423,10 @@ def show_main_page():
                                     
                                     st.markdown("---")
                                     st.markdown(f"### {diag_data['intervention_name']}: {diag_data['intervention_score']}%")
-                                    st.progress(diag_data['intervention_score'] / 100.0)
+                                    try:
+                                        st.progress(diag_data['intervention_score'] / 100.0, key=f"diag_prog_iv_{code}")
+                                    except TypeError:
+                                        st.progress(diag_data['intervention_score'] / 100.0)
                                     st.markdown(f"**{diag_data['intervention_comment']}**")
                                     
                                 with c2:
@@ -1435,7 +1444,7 @@ def show_main_page():
                                     st.markdown(f"<div style='color: {'#ff4b4b' if diag_data['乖離率'] > 10 else '#3B82F6'}; background-color: rgba(128, 128, 128, 0.08); padding: 10px; border-radius: 5px;'><strong>💡 AI解説:</strong> {diag_data['safe_explain']}</div>", unsafe_allow_html=True)
                                     st.markdown(f"**（判定: {diag_data['safe_judgment']}）**")
                                     
-                                    with st.expander("💡 安全性（壁からの乖離と撤退ライン）の見方を見る"):
+                                    with st.expander("💡 安全性（壁からの乖離と撤退ライン）の見方を見る", key=f"diag_exp_safe_{code}"):
                                         safe_explain_html = f"""
                                         <div style='font-size: 0.95rem; line-height: 1.6;'>
                                         当ツールでは、安全性を<strong>「最大の需給の壁（オレンジの点線）」からの乖離率（％）</strong>で判定します。<br>
@@ -1451,7 +1460,7 @@ def show_main_page():
                                         """
                                         st.markdown(safe_explain_html, unsafe_allow_html=True)
 
-                                draw_chart(diag_data)
+                                draw_chart(diag_data, chart_key=f"hagetaka_chart_{code}")
                         else: 
                             # 🚨 ここが確実に表示されるように修正
                             st.error(f"❌ 【 {code} 】 : データが取得できませんでした。\n\n※存在しない銘柄、または**アクセス集中による一時的な通信制限**の可能性があります。しばらく時間を空けてから再度お試しください。")
