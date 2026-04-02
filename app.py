@@ -146,23 +146,8 @@ def get_jpx_data():
 
 jpx_names, _ = get_jpx_data()
 
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-        f = float(value)
-        if np.isnan(f) or np.isinf(f):
-            return default
-        return f
-    except Exception:
-        return default
-
-
 def format_market_cap(oku_val):
-    oku_val = safe_float(oku_val, default=np.nan)
-    if np.isnan(oku_val) or oku_val < 0:
-        return "不明"
-    oku_val = int(round(oku_val))
+    oku_val = int(oku_val)
     if oku_val >= 10000:
         cho, oku = divmod(oku_val, 10000)
         return f"{cho}兆{oku}億円" if oku else f"{cho}兆円"
@@ -182,7 +167,7 @@ _CACHE_TTL_SECONDS = 900  # 15分（ブロック回避のための保護期間�
 
 def evaluate_stock(ticker):
     now = datetime.now(JST)
-
+    
     # 1. キャッシュの確認（成功データのみがここを通る）
     if ticker in _SUCCESS_CACHE:
         cached_time, cached_data = _SUCCESS_CACHE[ticker]
@@ -193,71 +178,39 @@ def evaluate_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="2y")
-
-        if hist is None or hist.empty:
-            return {
-                "status": "insufficient_data",
-                "title": "診断対象外",
-                "message": "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "detail": "上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
-            }
-
+        
+        if hist is None or hist.empty: 
+            return {"status": "not_found"}
+            
         info = stock.info or {}
-
+        
         try:
-            current_price = safe_float(hist["Close"].iloc[-1], default=np.nan)
-            current_vol = safe_float(hist["Volume"].iloc[-1], default=0.0)
+            current_price = float(hist['Close'].iloc[-1])
+            current_vol = float(hist['Volume'].iloc[-1])
         except IndexError:
-            return {
-                "status": "insufficient_data",
-                "title": "診断対象外",
-                "message": "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "detail": "分析に必要な価格データが十分にそろっていないため、診断を見送っています。"
-            }
-
-        if np.isnan(current_price) or current_price <= 0:
-            return {
-                "status": "insufficient_data",
-                "title": "診断対象外",
-                "message": "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "detail": "価格データが安定して取得できないため、診断結果を表示していません。"
-            }
-
-        avg_vol_100 = safe_float(hist["Volume"][-100:].mean() if len(hist) >= 100 else hist["Volume"].mean(), default=0.0)
-        shares = safe_float(info.get("sharesOutstanding"), default=0.0)
-
-        mc = safe_float(info.get("marketCap"), default=np.nan)
-        if np.isnan(mc) or mc <= 0:
-            fallback_mc = current_price * shares if shares > 0 else np.nan
-            mc = safe_float(fallback_mc, default=np.nan)
-        market_cap_oku = mc / 1e8 if not np.isnan(mc) else np.nan
-
-        data_points = {
-            "has_market_cap": not np.isnan(market_cap_oku) and market_cap_oku > 0,
-            "has_shares": shares > 0,
-            "has_avg_volume": avg_vol_100 > 0,
-            "has_hist_20": len(hist) >= 20,
-            "has_hist_60": len(hist) >= 60,
-        }
-        available_points = sum(data_points.values())
-
-        if available_points <= 1 or (len(hist) < 20 and not data_points["has_shares"] and not data_points["has_market_cap"]):
-            return {
-                "status": "insufficient_data",
-                "title": "診断対象外",
-                "message": "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "detail": "上場直後の銘柄や、出来高・時価総額などの分析材料が十分でない銘柄は、診断対象外となる場合があります。"
-            }
-
+            return {"status": "not_found"}
+        
+        avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
+        
+        shares = info.get('sharesOutstanding')
+        shares = float(shares) if shares is not None else 0.0
+        
+        mc = info.get('marketCap')
+        mc = float(mc) if mc is not None else (current_price * shares)
+        market_cap_oku = mc / 1e8
+        
         is_tob = False
         if len(hist) >= 5:
             recent_5 = hist.tail(5)
-            if current_price > 0 and (recent_5["High"].max() - recent_5["Low"].min()) / current_price * 100 < 1.0 and current_vol > 10000:
+            if current_price > 0 and (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100 < 1.0 and current_vol > 10000:
                 is_tob = True
 
-        div_rate = safe_float(info.get("dividendRate") or info.get("trailingAnnualDividendRate"), default=0.0)
-        payout = safe_float(info.get("payoutRatio"), default=0.0)
-
+        div_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate')
+        div_rate = float(div_rate) if div_rate is not None else 0.0
+        
+        payout = info.get('payoutRatio')
+        payout = float(payout) if payout is not None else 0.0
+        
         if div_rate > 0 and current_price > 0:
             yield_str = f"{(div_rate / current_price) * 100:.2f}%"
             dividend_text = f"{div_rate}円 (利回り: {yield_str} / 配当性向: {payout*100:.1f}%)"
@@ -265,69 +218,51 @@ def evaluate_stock(ticker):
             dividend_text = "無配"
 
         turnover = (current_vol / shares * 100) if shares > 0 else 0
-        if turnover >= 10:
-            turn_str = f"🔥🔥🔥 {turnover:.2f}% (超異常値)"
-        elif turnover >= 5:
-            turn_str = f"🔥🔥 {turnover:.2f}% (大口介入期待)"
-        elif turnover >= 2:
-            turn_str = f"🔥 {turnover:.2f}% (動意)"
-        else:
-            turn_str = f"💤 {turnover:.2f}% (平常)"
+        if turnover >= 10: turn_str = f"🔥🔥🔥 {turnover:.2f}% (超異常値)"
+        elif turnover >= 5: turn_str = f"🔥🔥 {turnover:.2f}% (大口介入期待)"
+        elif turnover >= 2: turn_str = f"🔥 {turnover:.2f}% (動意)"
+        else: turn_str = f"💤 {turnover:.2f}% (平常)"
 
         score = 10
-        if 500 <= market_cap_oku <= 2000:
-            score += 35
-        if avg_vol_100 > 0 and current_vol / avg_vol_100 >= 3:
-            score += 40
-        elif avg_vol_100 > 0 and current_vol / avg_vol_100 >= 1.5:
-            score += 25
+        if 500 <= market_cap_oku <= 2000: score += 35
+        if avg_vol_100 > 0 and current_vol / avg_vol_100 >= 3: score += 40
+        elif avg_vol_100 > 0 and current_vol / avg_vol_100 >= 1.5: score += 25
         score = min(90, score)
 
         hist_6mo = hist.tail(125)
-
+        
         try:
-            unique_prices = hist_6mo["Close"].dropna().unique()
+            unique_prices = hist_6mo['Close'].unique()
             if len(unique_prices) > 1:
                 bins_count = min(15, len(unique_prices))
-                price_bins = pd.cut(hist_6mo["Close"], bins=bins_count)
-                max_vol_price = hist_6mo.groupby(price_bins, observed=False)["Volume"].sum().idxmax().mid
+                price_bins = pd.cut(hist_6mo['Close'], bins=bins_count)
+                max_vol_price = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum().idxmax().mid
             else:
                 max_vol_price = current_price
         except Exception:
             max_vol_price = current_price
 
         deviation = ((current_price - max_vol_price) / max_vol_price) * 100 if max_vol_price > 0 else 0.0
-        stars = "★" * min(5, int((max_vol_price / current_price - 1) * 10) + 1) if current_price < max_vol_price else "★★★★★"
+        
+        stars = "★" * min(5, int((max_vol_price/current_price-1)*10)+1) if current_price < max_vol_price else "★★★★★"
 
         result = {
             "status": "success",
-            "コード": ticker.replace(".T", ""),
-            "銘柄名": jpx_names.get(ticker.replace(".T", ""), ticker),
-            "現在値": int(round(current_price)),
-            "時価総額_表示": format_market_cap(market_cap_oku),
-            "dividend_text": dividend_text,
-            "turnover_str": turn_str,
-            "ランク": "S" if score > 80 else "A" if score > 60 else "B",
-            "乖離率": float(deviation),
-            "hist": hist,
-            "max_vol_price": float(max_vol_price),
-            "recent_20_low": float(hist["Low"][-20:].min()) if len(hist) >= 20 else float(hist["Low"].min()),
-            "intervention_score": int(score),
-            "safe_judgment": "🚀 安全圏" if 0 < deviation < 10 else "📉 割安" if deviation < 0 else "⚠️ 警戒",
-            "is_tob_suspected": is_tob,
-            "star_rating": stars
+            "コード": ticker.replace(".T",""), "銘柄名": jpx_names.get(ticker.replace(".T",""), ticker),
+            "現在値": int(current_price), "時価総額_表示": format_market_cap(market_cap_oku),
+            "dividend_text": dividend_text, "turnover_str": turn_str, "ランク": "S" if score > 80 else "A" if score > 60 else "B",
+            "乖離率": float(deviation), "hist": hist, "max_vol_price": float(max_vol_price), 
+            "recent_20_low": float(hist['Low'][-20:].min()) if len(hist) >= 20 else float(hist['Low'].min()),
+            "intervention_score": int(score), "safe_judgment": "🚀 安全圏" if 0 < deviation < 10 else "📉 割安" if deviation < 0 else "⚠️ 警戒",
+            "is_tob_suspected": is_tob, "star_rating": stars
         }
-
+        
+        # 🚨 3. 成功した場合にのみ、15分キャッシュ領域へ保存
         _SUCCESS_CACHE[ticker] = (now, result)
         return result
-
-    except Exception:
-        return {
-            "status": "insufficient_data",
-            "title": "診断対象外",
-            "message": "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-            "detail": "データのそろい方により、診断を見送る場合があります。時間をおいて再度確認すると表示されることがあります。"
-        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # ==========================================
 # 画面描画
@@ -386,19 +321,16 @@ def show_main_page():
                     for c in codes:
                         res = evaluate_stock(f"{c}.T")
                         
-                        # ステータスごとに表示を分岐
-                        if res["status"] == "insufficient_data":
-                            notice_text = (
-                                f"【 {c} 】 ご案内\n\n"
-                                f"{res.get('message', 'この銘柄は現在診断対象外です。')}\n\n"
-                                f"{res.get('detail', '')}"
-                            )
-                            st.info(notice_text)
-
+                        # 🚨 厳密にステータスを判定して表示を分ける
+                        if res["status"] == "not_found":
+                            st.error(f"❌ 【 {c} 】 : 存在しない銘柄です。")
+                        
+                        elif res["status"] == "error":
+                            st.error(f"❌ 【 {c} 】 : 分析中に通信・計算エラーが発生しました。({res.get('message', '')})")
+                        
                         elif res["status"] == "success":
                             st.markdown('<div class="diagnosis-card-marker"></div>', unsafe_allow_html=True)
-                            if res['is_tob_suspected']:
-                                st.warning("🚨 TOB・MBOの可能性が高い値動きです。")
+                            if res['is_tob_suspected']: st.warning("🚨 TOB・MBOの可能性が高い値動きです。")
                             col1, col2 = st.columns([1, 2])
                             with col1:
                                 st.subheader(f"{res['コード']} {res['銘柄名']}")
@@ -411,7 +343,7 @@ def show_main_page():
                                 st.write(f"上値余地: {res['star_rating']}")
                                 st.info(f"安全性: {res['safe_judgment']} (壁から {res['乖離率']:.1f}%)")
                                 fig = go.Figure(data=[go.Candlestick(x=res['hist'].index, open=res['hist']['Open'], high=res['hist']['High'], low=res['hist']['Low'], close=res['hist']['Close'])])
-                                fig.update_layout(height=250, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
+                                fig.update_layout(height=250, margin=dict(l=0,r=0,t=0,b=0), xaxis_rangeslider_visible=False)
                                 st.plotly_chart(fig, use_container_width=True)
 
     with tab3:
