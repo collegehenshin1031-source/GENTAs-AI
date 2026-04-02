@@ -379,8 +379,9 @@ def get_logo_base64():
             return base64.b64encode(f.read()).decode()
     except: return None
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=900)
 def load_data() -> Dict:
+    """ratios.json を読む。名前はバッチ済みデータ＋辞書のみで解決し、Yahoo へは繋がない（全銘柄時の重さ対策）。"""
     p = Path("data/ratios.json")
     if not p.exists():
         return {}
@@ -393,7 +394,9 @@ def load_data() -> Dict:
         if isinstance(bucket_data, dict):
             for ticker, item in bucket_data.items():
                 if isinstance(item, dict):
-                    item["name"] = get_display_japanese_name(ticker, item.get("name"))
+                    item["name"] = get_display_japanese_name(
+                        ticker, item.get("name"), allow_yahoo_fallback=False
+                    )
 
     return data
 
@@ -577,7 +580,14 @@ TICKER_NAMES_JP = {
 }
 
 
-def get_display_japanese_name(ticker: str, fallback_name: str | None = None, info: dict | None = None) -> str:
+def get_display_japanese_name(
+    ticker: str,
+    fallback_name: str | None = None,
+    info: dict | None = None,
+    *,
+    allow_yahoo_fallback: bool = True,
+) -> str:
+    """allow_yahoo_fallback=False のとき Yahoo!ファイナンス日本へアクセスしない（一覧・load_data 用で軽量化）"""
     code_only = str(ticker or "").replace(".T", "").strip().upper()
     ticker_key = f"{code_only}.T" if code_only else str(ticker or "").strip().upper()
     fallback_name = (fallback_name or "").strip()
@@ -608,16 +618,17 @@ def get_display_japanese_name(ticker: str, fallback_name: str | None = None, inf
         if cand in allowed_brand_names:
             return cand
 
-    try:
-        url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-        res_yfjp = yf_session.get(url_yfjp, timeout=3)
-        match = re.search(r"<title>(.+?)(?:\(株\))?【", res_yfjp.text)
-        if match:
-            title_name = match.group(1).strip()
-            if title_name:
-                return title_name
-    except Exception:
-        pass
+    if allow_yahoo_fallback:
+        try:
+            url_yfjp = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
+            res_yfjp = yf_session.get(url_yfjp, timeout=3)
+            match = re.search(r"<title>(.+?)(?:\(株\))?【", res_yfjp.text)
+            if match:
+                title_name = match.group(1).strip()
+                if title_name:
+                    return title_name
+        except Exception:
+            pass
 
     for cand in candidates:
         cand = (cand or "").strip()
@@ -1054,7 +1065,7 @@ def render_card(ticker: str, d: Dict):
     
     code_only = ticker.replace(".T", "")
     url = f"https://finance.yahoo.co.jp/quote/{code_only}.T"
-    name_jp = get_display_japanese_name(ticker, d.get('name'))
+    name_jp = get_display_japanese_name(ticker, d.get("name"), allow_yahoo_fallback=False)
 
     tags_html = ""
     for tag in tags[:4]:
