@@ -4,11 +4,17 @@ HAGETAKA SCOPE - 日次候補抽出（GitHub Actions用）
 - 目的：市場データの“状態”を可視化し、候補を少数に絞る
 - 本ツールは補助ツールであり、銘柄推奨・売買助言ではありません
 
-出力：data/ratios.json
-- data: 候補（フィルタ済み・並び替え済み）
-- all_data: 参考（時価総額フィルタ済み）
+出力：
+- data/ratios.json … 候補（data）・参考（all_data）
+- data/history/shard_XX.json（64分割）… 診断用OHLCV+info。FULL_UNIVERSE=1 でJPX上場（プライム・スタンダード・グロース）をスキャン
+
+注意（全銘柄スキャン時）:
+- 実行は 1〜数時間かかることがある / GitHub Actions の timeout-minutes を十分に取ること
+- 一部銘柄は Yahoo 経由で欠損しうる / ジョブ全体が必ず成功するとは限らない
+- ローカルで短時間テストするときは FULL_UNIVERSE=0（固定辞書のみ）
 """
 
+import hashlib
 import io
 import json
 import os
@@ -1219,6 +1225,61 @@ TICKER_NAMES = {
 
 MIDCAP_TICKERS = list(TICKER_NAMES.keys())
 
+# 診断用ローカルキャッシュを分割するシャード数（全銘柄時も1ファイルあたり数十〜百銘柄程度）
+HISTORY_SHARD_COUNT = 64
+HISTORY_DIR = Path("data/history")
+
+
+def hash_ticker_shard_id(ticker: str) -> int:
+    return int(hashlib.md5(ticker.encode("utf-8")).hexdigest(), 16) % HISTORY_SHARD_COUNT
+
+
+def get_all_listed_tickers_jpx() -> list[str]:
+    """JPX上場一覧（プライム・スタンダード・グロース）から Yahoo 形式ティッカー一覧を返す"""
+    d = get_jpx_data()
+    if not d:
+        return []
+    out: list[str] = []
+    for code in d.keys():
+        code = str(code).strip()
+        if not code:
+            continue
+        out.append(f"{code}.T")
+    return sorted(set(out))
+
+
+def build_universe_tickers() -> list[str]:
+    """
+    FULL_UNIVERSE=1（デフォルト）: JPX 全銘柄 ∪ 固定辞書の和集合。
+    FULL_UNIVERSE=0: 従来どおり MIDCAP_TICKERS のみ（ローカル短時間テスト用）。
+    """
+    if os.environ.get("FULL_UNIVERSE", "0").strip() not in ("1", "true", "True"):
+        return list(MIDCAP_TICKERS)
+    jpx = get_all_listed_tickers_jpx()
+    if not jpx:
+        print("⚠️ JPX一覧の取得に失敗。TICKER_NAMES のみで続行します。")
+    merged = sorted(set(jpx) | set(MIDCAP_TICKERS))
+    return merged
+
+
+def write_history_shards(shards: list[dict], updated_at: str) -> None:
+    """data/history/shard_XX.json と meta.json を書き出す"""
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for i, bucket in enumerate(shards):
+        total += len(bucket)
+        (HISTORY_DIR / f"shard_{i:02d}.json").write_text(
+            json.dumps(bucket, ensure_ascii=False), encoding="utf-8"
+        )
+    meta = {
+        "updated_at": updated_at,
+        "shard_count": HISTORY_SHARD_COUNT,
+        "format": "sharded_v1",
+        "ticker_count": total,
+    }
+    (HISTORY_DIR / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"💾 保存: {HISTORY_DIR}/shard_00..shard_{HISTORY_SHARD_COUNT - 1:02d}.json （計 {total} 銘柄）")
+
 
 def get_jpx_data():
     try:
@@ -1463,10 +1524,11 @@ def determine_level(ma_score: float) -> int:
     return 0
 
 
-def fetch_volume_data(tickers: list[str], chunk_size: int = 10) -> tuple[dict, dict, dict]:
+def fetch_volume_data(tickers: list[str], chunk_size: int = 10) -> tuple[dict, dict, dict, list]:
     results: dict = {}
     qualified: dict = {}
     stock_history: dict = {}
+    shards: list[dict] = [{} for _ in range(HISTORY_SHARD_COUNT)]
     prev_streaks = load_previous_streaks()
     total = len(tickers)
     now_jst = datetime.now(JST)
@@ -1565,6 +1627,7 @@ def fetch_volume_data(tickers: list[str], chunk_size: int = 10) -> tuple[dict, d
                             "longName": info.get("longName"),
                         },
                     }
+                    shards[hash_ticker_shard_id(ticker)][ticker] = stock_history[ticker]
 
                     name = get_japanese_name(ticker, api_name)
                     in_range = (MARKET_CAP_MIN <= market_cap_oku <= MARKET_CAP_MAX)
@@ -1672,21 +1735,26 @@ def fetch_volume_data(tickers: list[str], chunk_size: int = 10) -> tuple[dict, d
 
         time.sleep(3)
 
-    return results, qualified, stock_history
+    return results, qualified, stock_history, shards
 
 
 def main():
+    global JPX_NAME_MAP
+
     now_jst = datetime.now(JST)
     updated_at = now_jst.strftime("%Y-%m-%d %H:%M:%S")
+
+    JPX_NAME_MAP = get_jpx_data()
+    universe = build_universe_tickers()
 
     print("=" * 60)
     print("🦅 HAGETAKA SCOPE - 日次候補抽出")
     print("=" * 60)
     print(f"⏰ 実行時刻: {updated_at} JST")
-    print(f"🎯 対象: 時価総額 {MARKET_CAP_MIN}億〜{MARKET_CAP_MAX}億円")
-    print(f"📋 監視銘柄数: {len(MIDCAP_TICKERS)}")
+    print(f"🎯 対象: 時価総額 {MARKET_CAP_MIN}億〜{MARKET_CAP_MAX}億円（候補フィルタ）")
+    print(f"📋 スキャン銘柄数: {len(universe)} （FULL_UNIVERSE={os.environ.get('FULL_UNIVERSE', '0')}）")
 
-    results, qualified, stock_history = fetch_volume_data(MIDCAP_TICKERS)
+    results, qualified, stock_history, shards = fetch_volume_data(universe)
 
     filtered = {k: v for k, v in results.items() if v.get("in_cap_range")}
     # 並び：LEVEL→MAScore→FlowScore
@@ -1716,9 +1784,12 @@ def main():
     print("💾 保存完了: data/ratios.json")
     print(f"🎯 候補: {len(sorted_qualified)} 件 / フィルタ通過: {len(filtered)} 件")
 
-    history_output = {"updated_at": updated_at, **stock_history}
-    Path("data/stock_history.json").write_text(json.dumps(history_output, ensure_ascii=False), encoding="utf-8")
-    print(f"💾 保存完了: data/stock_history.json ({len(stock_history)} 銘柄)")
+    write_history_shards(shards, updated_at)
+
+    if os.environ.get("WRITE_LEGACY_STOCK_HISTORY", "0").strip() in ("1", "true", "True"):
+        history_output = {"updated_at": updated_at, **stock_history}
+        Path("data/stock_history.json").write_text(json.dumps(history_output, ensure_ascii=False), encoding="utf-8")
+        print(f"💾 レガシー保存: data/stock_history.json ({len(stock_history)} 銘柄)")
 
 
 if __name__ == "__main__":
