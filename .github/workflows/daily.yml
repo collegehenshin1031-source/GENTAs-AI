@@ -1,4 +1,6 @@
-name: Daily Update & Notification
+# 平日 JST 16:30 頃開始: JPX 全銘柄スキャン → ratios.json + data/history/shard_*.json 更新
+# デメリット: 実行に 1〜数時間かかることがある / Yahoo 側の制限で一部銘柄欠損の可能性あり
+name: Daily Fetch (Full Universe)
 
 on:
   schedule:
@@ -8,9 +10,13 @@ on:
 permissions:
   contents: write
 
+env:
+  FULL_UNIVERSE: "1"
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -28,31 +34,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch volume data
+      - name: Fetch volume data (JPX universe)
         run: python fetch_data.py
 
       - name: Commit and push changes
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add data/ratios.json data/stock_history.json
+          git add data/ratios.json data/history/
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "📊 Update volume data $(date +'%Y-%m-%d %H:%M')"
+          git commit -m "📊 Update market data $(date +'%Y-%m-%d %H:%M')"
           git push
-
-      - name: Send Email Notifications
-        env:
-          ENABLE_EMAIL: "true"
-          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
-          GSHEETS_CREDENTIALS: ${{ secrets.GSHEETS_CREDENTIALS }}
-          SPREADSHEET_URL: ${{ secrets.SPREADSHEET_URL }}
-        run: |
-          if [ "$ENABLE_EMAIL" = "true" ]; then
-            echo "Starting email notification process..."
-            python send_notifications.py
-          else
-            echo "Email notification is currently DISABLED. Set ENABLE_EMAIL to true to activate."
-          fi
