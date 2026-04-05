@@ -42,7 +42,12 @@ import pytz
 import base64
 import pandas as pd
 import numpy as np
-import yfinance as yf
+try:
+    import yfinance as yf
+    _HAS_YF = True
+except ImportError:
+    yf = None
+    _HAS_YF = False
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -53,6 +58,9 @@ from google.oauth2.service_account import Credentials
 
 # 暗号化
 from cryptography.fernet import Fernet
+
+# KABU+ データ取得
+import kabuplus_client as kp
 
 # ==========================================
 # 定数
@@ -99,6 +107,48 @@ def get_yf_session():
     return session
 
 yf_session = get_yf_session()
+
+# ==========================================
+# 【KABU+ 一括データ】診断用の銘柄情報キャッシュ
+# ==========================================
+@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_kabuplus_info() -> dict:
+    """KABU+ から全銘柄の指標データを一括取得し info 辞書を構築（1時間キャッシュ）"""
+    try:
+        uid, pwd = kp.get_credentials()
+        if not uid or not pwd:
+            return {}
+        merged = kp.fetch_merged_data(uid, pwd)
+        if merged.empty:
+            return {}
+        return kp.build_info_lookup(merged)
+    except Exception as e:
+        print(f"⚠️ [_load_kabuplus_info] 取得失敗: {e}")
+        return {}
+
+
+def _get_kabuplus_info(ticker: str) -> dict:
+    """特定銘柄の KABU+ info を取得（キャッシュ済みルックアップ）"""
+    return _load_kabuplus_info().get(ticker, {})
+
+
+@st.cache_data(ttl=21600, show_spinner=False)  # 6時間キャッシュ（週次データなので長めに保持）
+def _load_kabuplus_margin() -> dict:
+    """KABU+ から全銘柄の信用残高データを一括取得し辞書を構築。
+    信用残高は週次（金曜日更新）のため、直近金曜のCSVを優先取得する。
+    """
+    try:
+        uid, pwd = kp.get_credentials()
+        if not uid or not pwd:
+            return {}
+        margin_df = kp.fetch_margin_data(uid, pwd)
+        if margin_df.empty:
+            return {}
+        return kp.build_margin_lookup(margin_df)
+    except Exception as e:
+        print(f"⚠️ [_load_kabuplus_margin] 取得失敗: {e}")
+        return {}
 
 # ==========================================
 # カート操作のコールバック関数（即時反映用）
@@ -483,31 +533,36 @@ def send_test_email(email: str, app_password: str) -> tuple[bool, str]:
 # ==========================================
 @st.cache_data(ttl=86400)
 def get_jpx_data():
-    try:
-        html_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(html_url, headers=headers, timeout=10)
-        response.raise_for_status()
+    """
+    JPX上場銘柄一覧を取得し (name_map, code_list) を返す。
+    fetch_data.py の get_jpx_data() と同ロジックで統一。
+    HTMLスクレイピング失敗時は既知の固定直接URLへフォールバックする。
+    """
+    DIRECT_XLS_URL = (
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/"
+        "tvdivq0000001vg2-att/data_j.xls"
+    )
+    headers = {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        )
+    }
 
-        match = re.search(r'href="([^"]+data_j\.(?:xls|xlsx|csv))"', response.text, flags=re.IGNORECASE)
-        if not match:
+    def _parse(content: bytes, is_csv: bool = False):
+        try:
+            if is_csv:
+                df = pd.read_csv(io.BytesIO(content), encoding="utf-8")
+            else:
+                df = pd.read_excel(io.BytesIO(content))
+        except Exception as e:
+            print(f"⚠️ [app/get_jpx_data] Excel/CSVパース失敗: {e}")
             return {}, []
-
-        file_url = "https://www.jpx.co.jp" + match.group(1)
-        file_response = requests.get(file_url, headers=headers, timeout=15)
-        file_response.raise_for_status()
-
-        if file_url.lower().endswith(".csv"):
-            df = pd.read_csv(io.BytesIO(file_response.content), encoding="utf-8")
-        else:
-            df = pd.read_excel(io.BytesIO(file_response.content))
-
         if df is None or df.empty or len(df.columns) < 3:
             return {}, []
-
         df = df.copy()
         market_col = df.columns[3] if len(df.columns) >= 4 else None
-
         if market_col is not None:
             market_series = df[market_col].astype(str)
             market_mask = market_series.str.contains("プライム|スタンダード|グロース", na=False)
@@ -527,15 +582,50 @@ def get_jpx_data():
 
         codes = df_tickers.iloc[:, 1].apply(safe_code)
         names = df_tickers.iloc[:, 2].astype(str).str.strip()
-
         name_map = {}
         for code, name in zip(codes, names):
             if code and name and name.lower() != "nan":
                 name_map[code] = name
-
         return name_map, list(name_map.keys())
-    except Exception:
-        return {}, []
+
+    # Step 1: HTMLページから最新URLを取得
+    file_url = None
+    is_csv = False
+    try:
+        html_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+        response = requests.get(html_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        match = re.search(r'href="([^"]+data_j\.(?:xls|xlsx|csv))"', response.text, flags=re.IGNORECASE)
+        if match:
+            file_url = "https://www.jpx.co.jp" + match.group(1)
+            is_csv = file_url.lower().endswith(".csv")
+        else:
+            print("⚠️ [app/get_jpx_data] HTMLにdata_jリンクなし → 固定URLへフォールバック")
+    except Exception as e:
+        print(f"⚠️ [app/get_jpx_data] HTMLページ取得失敗: {e} → 固定URLへフォールバック")
+
+    if not file_url:
+        file_url = DIRECT_XLS_URL
+
+    # Step 2: ファイルダウンロード＆パース
+    try:
+        file_response = requests.get(file_url, headers=headers, timeout=30)
+        file_response.raise_for_status()
+        return _parse(file_response.content, is_csv=is_csv)
+    except Exception as e:
+        print(f"❌ [app/get_jpx_data] ダウンロード失敗 ({file_url}): {e}")
+
+    # Step 3: 固定URLで再試行
+    if file_url != DIRECT_XLS_URL:
+        try:
+            print(f"🔄 [app/get_jpx_data] 固定URLで再試行")
+            file_response = requests.get(DIRECT_XLS_URL, headers=headers, timeout=30)
+            file_response.raise_for_status()
+            return _parse(file_response.content)
+        except Exception as e:
+            print(f"❌ [app/get_jpx_data] 固定URLも失敗: {e}")
+
+    return {}, []
 
 
 @st.cache_data(ttl=86400)
@@ -659,26 +749,13 @@ def check_dna(hist):
     except:
         return False
 
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return float(default)
-        v = float(value)
-        if pd.isna(v) or np.isinf(v):
-            return float(default)
-        return v
-    except Exception:
-        return float(default)
-
-
 def format_market_cap(oku_val):
-    oku_val = safe_float(oku_val, 0.0)
-    oku_int = int(round(oku_val))
-    if oku_int >= 10000:
-        cho = oku_int // 10000
-        oku = oku_int % 10000
+    oku_val = int(oku_val)
+    if oku_val >= 10000:
+        cho = oku_val // 10000
+        oku = oku_val % 10000
         return f"{cho}兆円" if oku == 0 else f"{cho}兆{oku}億円"
-    return f"{oku_int}億円"
+    return f"{oku_val}億円"
 
 # ==========================================
 # 案5: バッチ保存済みOHLCVキャッシュ（64シャード + レガシー1ファイル）
@@ -732,34 +809,6 @@ def load_ticker_history_row(ticker: str) -> dict | None:
     return None
 
 
-def _sanitize_hist_dataframe(hist: pd.DataFrame | None) -> pd.DataFrame | None:
-    if hist is None or not isinstance(hist, pd.DataFrame) or hist.empty:
-        return None
-    try:
-        hist = hist.copy()
-        required_cols = ["Open", "High", "Low", "Close", "Volume"]
-        for col in required_cols:
-            if col not in hist.columns:
-                return None
-            hist[col] = pd.to_numeric(hist[col], errors="coerce")
-
-        hist.index = pd.to_datetime(hist.index, errors="coerce")
-        hist = hist[~hist.index.isna()].sort_index()
-        hist = hist.dropna(subset=["Close"], how="any")
-        if hist.empty:
-            return None
-
-        hist["Volume"] = hist["Volume"].fillna(0)
-        hist["Open"] = hist["Open"].fillna(hist["Close"])
-        hist["High"] = hist["High"].fillna(hist[["Open", "Close"]].max(axis=1))
-        hist["Low"] = hist["Low"].fillna(hist[["Open", "Close"]].min(axis=1))
-
-        hist = hist.tail(520)
-        return hist if len(hist) >= 5 else None
-    except Exception:
-        return None
-
-
 def _build_hist_from_cache(ticker: str, history_data: dict):
     """stock_history.jsonのデータからpandas DataFrameを復元"""
     data = history_data.get(ticker)
@@ -767,16 +816,17 @@ def _build_hist_from_cache(ticker: str, history_data: dict):
         return None
     try:
         hist = pd.DataFrame({
-            "Open":   data.get("O", []),
-            "High":   data.get("H", []),
-            "Low":    data.get("L", []),
-            "Close":  data.get("C", []),
-            "Volume": data.get("V", []),
-        }, index=pd.to_datetime(data.get("dates", []), errors="coerce"))
+            "Open":   data["O"],
+            "High":   data["H"],
+            "Low":    data["L"],
+            "Close":  data["C"],
+            "Volume": data["V"],
+        }, index=pd.to_datetime(data["dates"]))
         hist.index.name = "Date"
-        return _sanitize_hist_dataframe(hist)
+        return hist
     except Exception:
         return None
+
 
 def _fetch_stooq_hist_jp(ticker: str) -> pd.DataFrame | None:
     """yfinance が空になる東証英字銘柄（151A 等）向け。Stooq 日足（例: 151a.jp）。"""
@@ -827,332 +877,437 @@ def _fetch_stooq_hist_jp(ticker: str) -> pd.DataFrame | None:
     return out
 
 
-def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 3, base_delay: float = 5.0):
-    """yfinanceからデータをリトライ付きで取得（案1+案2: セッション渡し＋exponential backoff）"""
-    last_error = None
-    for attempt in range(max_retries):
-        try:
-            session = get_yf_session()
-            stock = yf.Ticker(ticker, session=session)
-            hist = _sanitize_hist_dataframe(stock.history(period="2y"))
-            if hist is None or hist.empty or len(hist) < 5:
-                raise ValueError("データが空または不十分です")
-            info = stock.info or {}
-            return hist, info
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-    hist_sq = _sanitize_hist_dataframe(_fetch_stooq_hist_jp(ticker))
-    if hist_sq is not None and len(hist_sq) >= 5:
-        return hist_sq, {}
-    raise last_error if last_error else ValueError("データ取得に失敗しました")
-
-@st.cache_data(ttl=900, show_spinner=False)
-def _evaluate_stock_cached(ticker):
-    code_only = ticker.replace(".T", "")
-
-    def _notice(message: str, detail: str):
-        return {
-            "_status": "notice",
-            "コード": code_only,
-            "message": message,
-            "detail": detail,
-        }
+def _fetch_yahoo_chart_api(ticker: str) -> pd.DataFrame | None:
+    """
+    Yahoo Finance Chart API を直接呼び出してOHLCVを取得。
+    yfinanceライブラリを経由しないため、英字コード（151A等）や
+    yfinanceで取れない銘柄でも取得できることがある。
+    """
+    code = str(ticker or "").replace(".T", "").strip()
+    if not code:
+        return None
+    symbol = f"{code}.T"
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "1y", "interval": "1d", "includePrePost": "false"}
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
 
     try:
-        row = load_ticker_history_row(ticker)
-        hist = _build_hist_from_cache(ticker, {ticker: row}) if row else None
-        info = (row.get("info") or {}) if row else {}
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        result = data.get("chart", {}).get("result", [])
+        if not result:
+            return None
 
-        cache_usable = hist is not None and len(hist) >= 5
-        if cache_usable:
-            cache_usable = bool(
-                pd.api.types.is_numeric_dtype(hist["Close"]) and
-                pd.api.types.is_numeric_dtype(hist["Low"]) and
-                pd.api.types.is_numeric_dtype(hist["Open"])
-            )
-        if not cache_usable:
-            hist, info = _fetch_yf_data_with_retry(ticker)
+        timestamps = result[0].get("timestamp", [])
+        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+        if not timestamps or not quote:
+            return None
 
-        hist = _sanitize_hist_dataframe(hist)
-        if hist is None or hist.empty or len(hist) < 5:
-            return _notice(
-                "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
-            )
+        df = pd.DataFrame({
+            "Open": quote.get("open", []),
+            "High": quote.get("high", []),
+            "Low": quote.get("low", []),
+            "Close": quote.get("close", []),
+            "Volume": quote.get("volume", []),
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+        df.index = df.index.tz_convert("Asia/Tokyo").tz_localize(None)
+        df.index.name = "Date"
+        df = df.dropna(subset=["Close"])
+        if len(df) < 5:
+            return None
+        df["Volume"] = df["Volume"].fillna(0)
+        return df
+    except Exception:
+        return None
 
-        current_price = safe_float(hist["Close"].iloc[-1], np.nan)
-        current_vol = safe_float(hist["Volume"].iloc[-1], 0.0)
-        avg_vol_100 = safe_float(hist["Volume"].tail(100).mean() if len(hist) >= 100 else hist["Volume"].mean(), 0.0)
-        if pd.isna(current_price) or current_price <= 0:
-            return _notice(
-                "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "価格データが安定して取得できないため、診断結果を表示していません。"
-            )
 
-        market_cap = safe_float((info or {}).get('marketCap'), 0.0)
-        shares = safe_float((info or {}).get('sharesOutstanding'), 0.0)
-        if market_cap <= 0 and shares > 0 and current_price > 0:
-            market_cap = current_price * shares
-        market_cap_oku = safe_float(market_cap / 100000000, 0.0)
-        formatted_mcap = format_market_cap(market_cap_oku)
+def _fetch_kabuoji3(ticker: str) -> pd.DataFrame | None:
+    """
+    kabuoji3.com から日本株のOHLCVを取得。
+    日本株専用サイトのため、yfinance/Stooqで取れない銘柄でも取得可能。
+    ※ pd.read_html は lxml 依存のため、正規表現で手動パースする。
+    """
+    code = str(ticker or "").replace(".T", "").strip()
+    if not code:
+        return None
+    url = f"https://kabuoji3.com/stock/{code}/"
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
 
-        turnover_rate = (current_vol / shares) * 100 if shares > 0 and current_vol > 0 else 0.0
-        if turnover_rate >= 10.0:
-            turnover_str = f"🔥🔥🔥 {turnover_rate:.2f}% (超異常値・大相場警戒)"
-        elif turnover_rate >= 5.0:
-            turnover_str = f"🔥🔥 {turnover_rate:.2f}% (異常値・大口介入期待高)"
-        elif turnover_rate >= 2.0:
-            turnover_str = f"🔥 {turnover_rate:.2f}% (動意づき)"
-        elif turnover_rate > 0:
-            turnover_str = f"💤 {turnover_rate:.2f}% (平常運転)"
-        else:
-            turnover_str = "算出不可"
+        # テーブル行を正規表現で抽出: <tr><td>日付</td><td>始値</td>...
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", resp.text, re.DOTALL)
+        records = []
+        for row_html in rows:
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL)
+            if len(cells) >= 6:
+                # 日付, 始値, 高値, 安値, 終値, 出来高
+                date_str = cells[0].strip()
+                if not re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+                    continue
+                try:
+                    o = float(cells[1].replace(",", ""))
+                    h = float(cells[2].replace(",", ""))
+                    l = float(cells[3].replace(",", ""))
+                    c = float(cells[4].replace(",", ""))
+                    v = float(cells[5].replace(",", ""))
+                    records.append({"Date": date_str, "Open": o, "High": h, "Low": l, "Close": c, "Volume": v})
+                except ValueError:
+                    continue
 
-        dividend_rate = safe_float((info or {}).get('dividendRate') or (info or {}).get('trailingAnnualDividendRate'), 0.0)
-        payout_ratio = safe_float((info or {}).get('payoutRatio'), 0.0)
-        div_yield = safe_float((info or {}).get('dividendYield') or (info or {}).get('trailingAnnualDividendYield'), 0.0)
-        if dividend_rate > 0:
-            payout_str = f"{payout_ratio * 100:.1f}%" if payout_ratio > 0 else "-"
-            yield_str = f"{div_yield * 100:.2f}%" if div_yield > 0 else "-"
-            dividend_text = f"{dividend_rate}円 （利回り: {yield_str} / 配当性向: {payout_str}）"
-        else:
-            dividend_text = "無配"
+        if len(records) < 5:
+            return None
 
-        jp_name = get_display_japanese_name(ticker, info=info)
-        if market_cap_oku >= 5000:
-            cap_category = "large"
-            intervention_name = "🏢 機関投資家・大口流入期待度"
-        elif market_cap_oku >= 50:
-            cap_category = "target"
-            intervention_name = "🦅 大口資金・介入期待度 (目安)"
-        else:
-            cap_category = "small"
-            intervention_name = "⚠️ 短期資金・過熱度 (超小型)"
+        df = pd.DataFrame(records)
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+        df["Volume"] = df["Volume"].fillna(0)
+        return df if len(df) >= 5 else None
+    except Exception:
+        return None
 
-        hist_6mo = hist.tail(125).copy()
+
+def _fetch_yf_data_with_retry(ticker: str, max_retries: int = 2, base_delay: float = 3.0):
+    """
+    OHLCV履歴のみを取得（高速化版）。
+    ★ info は KABU+ から取得するため、ここでは取らない。
+    ★ 4段階フォールバック: yf.download() → Yahoo Chart API直接 → Stooq → kabuoji3
+    """
+    last_error = None
+
+    # 1) yf.download()（yfinance が利用可能な場合のみ）
+    if _HAS_YF:
+        for attempt in range(max_retries):
+            try:
+                session = get_yf_session()
+                hist = yf.download(
+                    tickers=[ticker], period="2y", interval="1d",
+                    auto_adjust=True, progress=False, threads=False,
+                    session=session,
+                )
+                if hist is not None and not hist.empty and len(hist) >= 5:
+                    if isinstance(hist.columns, pd.MultiIndex):
+                        hist.columns = hist.columns.get_level_values(0)
+                    hist = hist[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                    if len(hist) >= 5:
+                        return hist
+                raise ValueError("データが空または不十分です")
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+
+    # 2) Yahoo Finance Chart API 直接呼び出し（yfinanceライブラリを迂回）
+    hist_yc = _fetch_yahoo_chart_api(ticker)
+    if hist_yc is not None and len(hist_yc) >= 5:
+        return hist_yc
+
+    # 3) Stooq フォールバック（英字コード 151A 等に有効）
+    hist_sq = _fetch_stooq_hist_jp(ticker)
+    if hist_sq is not None and len(hist_sq) >= 5:
+        return hist_sq
+
+    # 4) kabuoji3 フォールバック（日本株専用・最終手段）
+    hist_kj = _fetch_kabuoji3(ticker)
+    if hist_kj is not None and len(hist_kj) >= 5:
+        return hist_kj
+
+    raise last_error if last_error else ValueError("データ取得に失敗しました")
+
+
+# 🚨 【エラー回避＆キャッシュ対策】の内部関数（データ取得失敗時は例外を投げてキャッシュさせない）
+@st.cache_data(ttl=900, show_spinner=False)
+def _evaluate_stock_cached(ticker):
+    # ★ Step 1: info は KABU+ から一括取得済みデータを優先使用
+    info = _get_kabuplus_info(ticker)
+
+    # ★ Step 2: OHLCV はバッチキャッシュ → yf.download() → Stooq の順
+    row = load_ticker_history_row(ticker)
+    hist = _build_hist_from_cache(ticker, {ticker: row}) if row else None
+
+    if hist is not None and len(hist) >= 5:
+        # キャッシュヒット: KABU+ info がなければキャッシュの info を使う
+        if not info:
+            info = (row.get("info") or {}) if row else {}
+    else:
+        # キャッシュミス: OHLCV のみ取得（info は KABU+ で済んでいる）
+        hist = _fetch_yf_data_with_retry(ticker)
+
+    # 取得失敗時は例外を出してキャッシュ化を回避する
+    if hist is None or hist.empty or len(hist) < 5:
+        raise ValueError("Insufficient data or fetch limit")
+
+    current_price = hist['Close'].iloc[-1]
+    current_vol = hist['Volume'].iloc[-1]
+
+    # 少ない日数でも計算できるように修正
+    avg_vol_100 = hist['Volume'][-100:].mean() if len(hist) >= 100 else hist['Volume'].mean()
+    
+    # yfinanceから欠損値(None)が返ってきた場合に確実に 0 に変換する
+    market_cap = info.get('marketCap') or 0
+    shares = info.get('sharesOutstanding') or 0
+    if market_cap == 0: market_cap = current_price * shares
+    market_cap_oku = market_cap / 100000000
+    
+    formatted_mcap = format_market_cap(market_cap_oku)
+
+    turnover_rate = (current_vol / shares) * 100 if shares > 0 and current_vol > 0 else 0
+        
+    if turnover_rate >= 10.0: turnover_str = f"🔥🔥🔥 {turnover_rate:.2f}% (超異常値・大相場警戒)"
+    elif turnover_rate >= 5.0: turnover_str = f"🔥🔥 {turnover_rate:.2f}% (異常値・大口介入期待高)"
+    elif turnover_rate >= 2.0: turnover_str = f"🔥 {turnover_rate:.2f}% (動意づき)"
+    elif turnover_rate > 0: turnover_str = f"💤 {turnover_rate:.2f}% (平常運転)"
+    else: turnover_str = "算出不可"
+
+    dividend_rate = info.get('dividendRate') or info.get('trailingAnnualDividendRate') or 0
+    payout_ratio = info.get('payoutRatio') or 0
+    div_yield = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0
+
+    if dividend_rate > 0:
+        payout_str = f"{payout_ratio * 100:.1f}%" if payout_ratio > 0 else "-"
+        yield_str = f"{div_yield * 100:.2f}%" if div_yield > 0 else "-"
+        dividend_text = f"{dividend_rate}円 （利回り: {yield_str} / 配当性向: {payout_str}）"
+    else:
+        dividend_text = "無配"
+
+    code_only = ticker.replace(".T", "")
+    jp_name = get_display_japanese_name(ticker, info=info)
+
+    if market_cap_oku >= 5000:
+        cap_category = "large"
+        intervention_name = "🏢 機関投資家・大口流入期待度"
+    elif market_cap_oku >= 50:
+        cap_category = "target"
+        intervention_name = "🦅 大口資金・介入期待度 (目安)"
+    else:
+        cap_category = "small"
+        intervention_name = "⚠️ 短期資金・過熱度 (超小型)"
+
+    hist_6mo = hist.tail(125)
+    
+    # 価格が全く動いていない銘柄で pd.cut がエラーを起こすのを防ぐ
+    if hist_6mo['Close'].nunique() > 1:
+        price_bins = pd.cut(hist_6mo['Close'], bins=15)
+        vol_profile = hist_6mo.groupby(price_bins, observed=False)['Volume'].sum()
         try:
-            close_series = pd.to_numeric(hist_6mo['Close'], errors='coerce').dropna()
-            if len(close_series) >= 2 and close_series.nunique() > 1:
-                bins_count = min(15, int(close_series.nunique()))
-                price_bins = pd.cut(close_series, bins=bins_count)
-                vol_profile = pd.to_numeric(hist_6mo.loc[close_series.index, 'Volume'], errors='coerce').fillna(0).groupby(price_bins, observed=False).sum()
-                max_vol_price = safe_float(getattr(vol_profile.idxmax(), 'mid', current_price), current_price)
-            else:
-                max_vol_price = current_price
+            max_vol_price = vol_profile.idxmax().mid
         except Exception:
             max_vol_price = current_price
+    else:
+        max_vol_price = current_price
+        
+    recent_20_low = hist['Low'][-20:].min() if len(hist) >= 20 else hist['Low'].min()
 
-        recent_20_low = safe_float(hist['Low'].tail(20).min() if len(hist) >= 20 else hist['Low'].min(), current_price)
+    upside_potential = 0
+    is_blue_sky = False
+    
+    if current_price >= max_vol_price:
+        is_blue_sky = True
+    else:
+        upside_potential = ((max_vol_price - current_price) / current_price) * 100
 
-        upside_potential = 0.0
-        is_blue_sky = False
-        if current_price >= max_vol_price:
-            is_blue_sky = True
-        elif current_price > 0:
-            upside_potential = ((max_vol_price - current_price) / current_price) * 100
-        deviation = ((current_price - max_vol_price) / max_vol_price) * 100 if max_vol_price > 0 else 0.0
+    deviation = ((current_price - max_vol_price) / max_vol_price) * 100
 
-        if is_blue_sky: pot_level = 4
-        elif upside_potential >= 30: pot_level = 3
-        elif upside_potential >= 15: pot_level = 2
-        elif upside_potential >= 5: pot_level = 1
-        else: pot_level = 0
+    if is_blue_sky: pot_level = 4
+    elif upside_potential >= 30: pot_level = 3
+    elif upside_potential >= 15: pot_level = 2
+    elif upside_potential >= 5: pot_level = 1
+    else: pot_level = 0
 
-        max_stars = 5 if deviation <= 10.0 else 4 if deviation <= 20.0 else 3
-        raw_stars = pot_level + 1
-        final_stars = min(raw_stars, max_stars)
-        star_rating = "★" * final_stars + "☆" * (5 - final_stars)
+    max_stars = 5 if deviation <= 10.0 else 4 if deviation <= 20.0 else 3
+    raw_stars = pot_level + 1
+    final_stars = min(raw_stars, max_stars)
+    star_rating = "★" * final_stars + "☆" * (5 - final_stars)
 
-        if raw_stars > final_stars:
-            if final_stars == 4:
-                patterns = [
-                    ("【上昇トレンド・高値警戒】", "上値の壁は薄いものの、直近底値からの上昇が続いており、新規参入は短期目線での対応が無難な水準です。"),
-                    ("【モメンタム継続・押し目待ち】", "強い勢いを保っていますが、やや過熱感が出てきました。リスクを抑えるなら押し目を待つのが一案です。"),
-                    ("【高値圏の順張り局面】", "上値余地はありますが、すでに一定の上昇を遂げています。利益確定売りに警戒しつつの判断が求められます。")
-                ]
-            else:
-                patterns = [
-                    ("【高値圏のモメンタム相場】", "上値を抑える壁はなく強いトレンドですが、乖離率が高く高値掴みのリスクがあります。短期戦と割り切った対応が求められる水準です。"),
-                    ("【急騰後・リスクリワード低下】", "勢いは非常に強いものの、今からの新規エントリーはリスクとリターンのバランスが取りにくくなっています。慎重な判断が必要です。"),
-                    ("【過熱気味の上昇波】", "上値余地を残しつつも、テクニカル的には過熱感が漂います。無理に深追いせず、冷静に状況を見極めたい局面です。")
-                ]
+    if raw_stars > final_stars:
+        if final_stars == 4:
+            patterns = [
+                ("【上昇トレンド・高値警戒】", "上値の壁は薄いものの、直近底値からの上昇が続いており、新規参入は短期目線での対応が無難な水準です。"),
+                ("【モメンタム継続・押し目待ち】", "強い勢いを保っていますが、やや過熱感が出てきました。リスクを抑えるなら押し目を待つのが一案です。"),
+                ("【高値圏の順張り局面】", "上値余地はありますが、すでに一定の上昇を遂げています。利益確定売りに警戒しつつの判断が求められます。")
+            ]
         else:
-            if pot_level == 4:
-                patterns = [
-                    ("【青天井モード】", "上値に目立った需給の壁（抵抗線）がなく、売り手が不在の真空地帯に突入しています。"),
-                    ("【上値抵抗クリア】", "過去の重いしこり玉（含み損）エリアを突破しており、需給が好転している局面です。"),
-                    ("【真空地帯への突入】", "目立った戻り売り圧力が少なく、トレンドに逆らわない順張りが有効な水準です。"),
-                    ("【売り手不在の快晴】", "上値での迷いが生じにくく、資金流入がストレートに株価に反映されやすい帯域にいます。"),
-                    ("【需給良好・上値追い】", "過去の取引の壁を抜けました。ただし、急ピッチな上昇時は利食いにも留意してください。"),
-                    ("【視界良好チャート】", "上値を抑えつける強固な壁が見当たりません。資金の逃げ足にだけ注意して波に乗りたい位置です。")
-                ]
-            elif pot_level == 3:
-                patterns = [
-                    ("【大幅な上値余地】", "強固な抵抗線まで距離があり、大きな値幅取りが狙えるポテンシャルを秘めています。"),
-                    ("【上値余地：特大】", "最大の壁まで十分な空間が開いており、大口の仕掛けが入りやすいエリアです。"),
-                    ("【リバウンド妙味】", "上値の重い水準まで距離があるため、反発トレンドに乗れた際のリターンが大きくなりやすい形状です。"),
-                    ("【ターゲット遠方】", "主要なヤレヤレ売りが降ってくる水準まで、軽快な足取りが期待できます。"),
-                    ("【絶好の上昇空間】", "次の大きな節目まで邪魔する壁がなく、買い圧力が素直に効きやすいチャートです。"),
-                    ("【値幅取り期待ゾーン】", "出来高の壁まで距離的余裕があり、トレンド発生時の爆発力に期待が持てる位置取りです。")
-                ]
-            elif pot_level == 2:
-                patterns = [
-                    ("【堅実な上値余地】", "次の抵抗帯まで適度な距離があり、セオリー通りの着実な上昇が見込めます。"),
-                    ("【上値余地：中】", "極端な遠さではありませんが、壁に到達するまで十分に利益を狙える水準にあります。"),
-                    ("【標準的なターゲット】", "最も分厚い出来高の壁に向けて、じわじわと水準を切り上げる展開が期待されます。"),
-                    ("【ステップアップ局面】", "まずは直上の壁を目標に、資金の流入に伴って堅調に推移しやすい位置です。"),
-                    ("【適度な空間】", "壁までの距離感として「ちょうど狙いやすい」位置取り。押し目があれば拾いたい形状です。"),
-                    ("【トレンド追従向きの局面】", "上値抵抗までの道のりは見えており、無理のない範囲で波に乗るのが有効な局面です。")
-                ]
-            elif pot_level == 1:
-                patterns = [
-                    ("【抵抗帯接近】", "すぐ上に出来高の壁が迫っています。ここを突破できるかが目先の最大の焦点となります。"),
-                    ("【激戦区への突入】", "過去の取引が密集するエリアが間近です。売り買いが交錯しやすく、乱高下に注意が必要です。"),
-                    ("【上値の壁テスト】", "分厚い壁へのアタック局面。跳ね返されるリスクも考慮し、打診買いから入りたい水準です。"),
-                    ("【ブレイク前夜警戒】", "すぐ上の抵抗線を明確に上抜ければ景色が一変しますが、現状はまだ重い壁の下に位置しています。"),
-                    ("【上値余地：小】", "ターゲットまでの距離が短く、ここから新規で大きな値幅を狙うにはややリスクが伴う位置です。"),
-                    ("【壁打ち反落リスク】", "壁にぶつかって反落する「壁打ち」になりやすい位置。突破を確認してからの参戦でも遅くありません。")
-                ]
-            else:
-                patterns = [
-                    ("【頭打ち警戒】", "現在値のすぐ上に強烈なしこり玉が大量待機しており、上値が極めて重い状態です。"),
-                    ("【岩盤到達・上値重し】", "過去最大の出来高を記録した価格帯に突入しています。大量の戻り売りを消化する莫大なパワーが必要です。"),
-                    ("【ヤレヤレ売り集中エリア】", "「買値に戻ったら売ろう」と待っていた投資家の売りが降り注ぐ、最も苦しい価格帯です。"),
-                    ("【上値抵抗MAX】", "需給面での障壁が一番高いエリアです。好材料などの強力なエンジンがない限り、突破は困難です。"),
-                    ("【ブレイクアウト待ちが一案】", "この分厚い壁の中での勝負は分が悪いです。明確に上抜けて真空地帯に入るのを待つのが賢明です。"),
-                    ("【撤退ラインの徹底が重要】", "壁に跳ね返されて急落するリスクが高い水準です。保有している場合は利益確定も視野に入る位置と言えます。")
-                ]
-
-        selected_pattern = random.choice(patterns)
-        star_desc = selected_pattern[0]
-        base_logic = selected_pattern[1]
-
-        if cap_category == "large":
-            flavor_logic = "時価総額が巨大なため値動きは重めですが、機関投資家や外国人投資家の資金流入をエンジンとした、強力で重厚なトレンドが期待できます。"
-        elif cap_category == "target":
-            flavor_logic = "中小型株として大口資金が最も好む規模感であり、資金が投下されれば一気に株価が動意づく（または壁を突破する）ポテンシャルを秘めています。"
+            patterns = [
+                ("【高値圏のモメンタム相場】", "上値を抑える壁はなく強いトレンドですが、乖離率が高く高値掴みのリスクがあります。短期戦と割り切った対応が求められる水準です。"),
+                ("【急騰後・リスクリワード低下】", "勢いは非常に強いものの、今からの新規エントリーはリスクとリターンのバランスが取りにくくなっています。慎重な判断が必要です。"),
+                ("【過熱気味の上昇波】", "上値余地を残しつつも、テクニカル的には過熱感が漂います。無理に深追いせず、冷静に状況を見極めたい局面です。")
+            ]
+    else:
+        if pot_level == 4:
+            patterns = [
+                ("【青天井モード】", "上値に目立った需給の壁（抵抗線）がなく、売り手が不在の真空地帯に突入しています。"),
+                ("【上値抵抗クリア】", "過去の重いしこり玉（含み損）エリアを突破しており、需給が好転している局面です。"),
+                ("【真空地帯への突入】", "目立った戻り売り圧力が少なく、トレンドに逆らわない順張りが有効な水準です。"),
+                ("【売り手不在の快晴】", "上値での迷いが生じにくく、資金流入がストレートに株価に反映されやすい帯域にいます。"),
+                ("【需給良好・上値追い】", "過去の取引の壁を抜けました。ただし、急ピッチな上昇時は利食いにも留意してください。"),
+                ("【視界良好チャート】", "上値を抑えつける強固な壁が見当たりません。資金の逃げ足にだけ注意して波に乗りたい位置です。")
+            ]
+        elif pot_level == 3:
+            patterns = [
+                ("【大幅な上値余地】", "強固な抵抗線まで距離があり、大きな値幅取りが狙えるポテンシャルを秘めています。"),
+                ("【上値余地：特大】", "最大の壁まで十分な空間が開いており、大口の仕掛けが入りやすいエリアです。"),
+                ("【リバウンド妙味】", "上値の重い水準まで距離があるため、反発トレンドに乗れた際のリターンが大きくなりやすい形状です。"),
+                ("【ターゲット遠方】", "主要なヤレヤレ売りが降ってくる水準まで、軽快な足取りが期待できます。"),
+                ("【絶好の上昇空間】", "次の大きな節目まで邪魔する壁がなく、買い圧力が素直に効きやすいチャートです。"),
+                ("【値幅取り期待ゾーン】", "出来高の壁まで距離的余裕があり、トレンド発生時の爆発力に期待が持てる位置取りです。")
+            ]
+        elif pot_level == 2:
+            patterns = [
+                ("【堅実な上値余地】", "次の抵抗帯まで適度な距離があり、セオリー通りの着実な上昇が見込めます。"),
+                ("【上値余地：中】", "極端な遠さではありませんが、壁に到達するまで十分に利益を狙える水準にあります。"),
+                ("【標準的なターゲット】", "最も分厚い出来高の壁に向けて、じわじわと水準を切り上げる展開が期待されます。"),
+                ("【ステップアップ局面】", "まずは直上の壁を目標に、資金の流入に伴って堅調に推移しやすい位置です。"),
+                ("【適度な空間】", "壁までの距離感として「ちょうど狙いやすい」位置取り。押し目があれば拾いたい形状です。"),
+                ("【トレンド追従向きの局面】", "上値抵抗までの道のりは見えており、無理のない範囲で波に乗るのが有効な局面です。")
+            ]
+        elif pot_level == 1:
+            patterns = [
+                ("【抵抗帯接近】", "すぐ上に出来高の壁が迫っています。ここを突破できるかが目先の最大の焦点となります。"),
+                ("【激戦区への突入】", "過去の取引が密集するエリアが間近です。売り買いが交錯しやすく、乱高下に注意が必要です。"),
+                ("【上値の壁テスト】", "分厚い壁へのアタック局面。跳ね返されるリスクも考慮し、打診買いから入りたい水準です。"),
+                ("【ブレイク前夜警戒】", "すぐ上の抵抗線を明確に上抜ければ景色が一変しますが、現状はまだ重い壁の下に位置しています。"),
+                ("【上値余地：小】", "ターゲットまでの距離が短く、ここから新規で大きな値幅を狙うにはややリスクが伴う位置です。"),
+                ("【壁打ち反落リスク】", "壁にぶつかって反落する「壁打ち」になりやすい位置。突破を確認してからの参戦でも遅くありません。")
+            ]
         else:
-            flavor_logic = "※ただし時価総額が小さすぎるため、プロは資金を入れづらい銘柄です。主に個人投資家による短期的な値幅取りの対象（乱高下）になりやすいため、リスク管理を徹底してください。"
-        star_logic = base_logic + "<br><br>" + flavor_logic
+            patterns = [
+                ("【頭打ち警戒】", "現在値のすぐ上に強烈なしこり玉が大量待機しており、上値が極めて重い状態です。"),
+                ("【岩盤到達・上値重し】", "過去最大の出来高を記録した価格帯に突入しています。大量の戻り売りを消化する莫大なパワーが必要です。"),
+                ("【ヤレヤレ売り集中エリア】", "「買値に戻ったら売ろう」と待っていた投資家の売りが降り注ぐ、最も苦しい価格帯です。"),
+                ("【上値抵抗MAX】", "需給面での障壁が一番高いエリアです。好材料などの強力なエンジンがない限り、突破は困難です。"),
+                ("【ブレイクアウト待ちが一案】", "この分厚い壁の中での勝負は分が悪いです。明確に上抜けて真空地帯に入るのを待つのが賢明です。"),
+                ("【撤退ラインの徹底が重要】", "壁に跳ね返されて急落するリスクが高い水準です。保有している場合は利益確定も視野に入る位置と言えます。")
+            ]
 
-        past_1y = hist.tail(250).copy()
-        year_high = safe_float(pd.to_numeric(past_1y['High'], errors='coerce').max(), current_price)
-        year_low = safe_float(pd.to_numeric(past_1y['Low'], errors='coerce').min(), current_price)
-        position_score = 0.5
-        if year_high != year_low:
-            position_score = safe_float((current_price - year_low) / (year_high - year_low), 0.5)
+    selected_pattern = random.choice(patterns)
+    star_desc = selected_pattern[0]
+    base_logic = selected_pattern[1]
 
-        has_dna = check_dna(hist)
-        vol_ratio = safe_float(current_vol / avg_vol_100, 0.0) if avg_vol_100 > 0 else 0.0
-        is_platinum = 500 <= market_cap_oku <= 2000
-        is_magma = vol_ratio >= 1.5
+    flavor_logic = ""
+    if cap_category == "large": flavor_logic = "時価総額が巨大なため値動きは重めですが、機関投資家や外国人投資家の資金流入をエンジンとした、強力で重厚なトレンドが期待できます。"
+    elif cap_category == "target": flavor_logic = "中小型株として大口資金が最も好む規模感であり、資金が投下されれば一気に株価が動意づく（または壁を突破する）ポテンシャルを秘めています。"
+    else: flavor_logic = "※ただし時価総額が小さすぎるため、プロは資金を入れづらい銘柄です。主に個人投資家による短期的な値幅取りの対象（乱高下）になりやすいため、リスク管理を徹底してください。"
 
-        if deviation <= -5.0:
-            safe_judgment = "📉 割安：底値仕込みが適切とされるゾーン（任意）"
-            safe_explain = "現在値が需給の壁より下に位置する「割安圏」です。直近底値（青の点線）を割ったら撤退というルールで、安値で仕込めるチャンスと言えます。"
-        elif deviation <= 0.0:
-            safe_judgment = "⚔️ 激戦：ブレイク前夜期待"
-            safe_explain = "分厚い需給の壁へのアタック目前です。ここを明確に上抜ければ一気に青空が広がる激戦区と位置付けられます。"
-        elif deviation <= 10.0:
-            safe_judgment = "🚀 安全圏：トレンド初動かも！？"
-            safe_explain = "需給の壁を突破したばかりで、最も素直に上昇の波に乗りやすいベストタイミングになりやすい水準です。"
-        elif deviation <= 20.0:
-            safe_judgment = "⚠️ 警戒：短期過熱気味警戒レベル"
-            safe_explain = "壁の突破から一定の上昇をしており少し離れすぎました。壁付近までの「押し目（下落）」を待つのが無難です。"
-        else:
-            safe_judgment = "💀 高度な警戒：高値掴みリスク大"
-            safe_explain = "壁から完全に乖離した超高値圏です。今から飛び乗るのは極めて危険で、上級者でも難しいゾーンのため注意必須です。"
+    star_logic = base_logic + "<br><br>" + flavor_logic
 
-        intervention_score = 0
-        if is_platinum: intervention_score += 35
-        elif 100 <= market_cap_oku <= 5000: intervention_score += 15
-        if vol_ratio >= 3.0: intervention_score += 40
-        elif vol_ratio >= 1.5: intervention_score += 25
-        if position_score <= 0.2: intervention_score += 15
-        if has_dna: intervention_score += 10
-        intervention_score = int(round(min(intervention_score, 100) / 10.0)) * 10
-        intervention_score = max(10, min(intervention_score, 90))
+    past_1y = hist[-250:]
+    year_high = past_1y['High'].max()
+    year_low = past_1y['Low'].min()
+    position_score = 0.5
+    if year_high != year_low:
+        position_score = (current_price - year_low) / (year_high - year_low)
+        
+    has_dna = check_dna(hist)
+    vol_ratio = current_vol / avg_vol_100 if avg_vol_100 > 0 else 0
+    
+    is_platinum = 500 <= market_cap_oku <= 2000
+    is_magma = vol_ratio >= 1.5
 
-        if intervention_score >= 80:
-            intervention_comment = "🚨 【極めて濃厚】大規模な資金流入のシグナルが点灯しています。"
-        elif intervention_score >= 50:
-            intervention_comment = "👀 【予兆あり】平常時とは異なる資金の動きが観測されています。"
-        else:
-            intervention_comment = "💤 【静観】現在は目立った資金流入の動きは検出されていません。"
+    safe_judgment, safe_explain = "", ""
+    if deviation <= -5.0:
+        safe_judgment = "📉 割安：底値仕込みが適切とされるゾーン（任意）"
+        safe_explain = "現在値が需給の壁より下に位置する「割安圏」です。直近底値（青の点線）を割ったら撤退というルールで、安値で仕込めるチャンスと言えます。"
+    elif deviation <= 0.0:
+        safe_judgment = "⚔️ 激戦：ブレイク前夜期待"
+        safe_explain = "分厚い需給の壁へのアタック目前です。ここを明確に上抜ければ一気に青空が広がる激戦区と位置付けられます。"
+    elif deviation <= 10.0:
+        safe_judgment = "🚀 安全圏：トレンド初動かも！？"
+        safe_explain = "需給の壁を突破したばかりで、最も素直に上昇の波に乗りやすいベストタイミングになりやすい水準です。"
+    elif deviation <= 20.0:
+        safe_judgment = "⚠️ 警戒：短期過熱気味警戒レベル"
+        safe_explain = "壁の突破から一定の上昇をしており少し離れすぎました。壁付近までの「押し目（下落）」を待つのが無難です。"
+    else:
+        safe_judgment = "💀 高度な警戒：高値掴みリスク大"
+        safe_explain = "壁から完全に乖離した超高値圏です。今から飛び乗るのは極めて危険で、上級者でも難しいゾーンのため注意必須です。"
 
-        base_rank = "D"
-        if intervention_score >= 80 and (is_blue_sky or upside_potential >= 30): base_rank = "S"
-        elif intervention_score >= 70: base_rank = "A"
-        elif intervention_score >= 50 or (is_platinum and position_score <= 0.5): base_rank = "B"
-        else: base_rank = "C"
+    intervention_score = 0
+    if is_platinum: intervention_score += 35
+    elif 100 <= market_cap_oku <= 5000: intervention_score += 15
+    if vol_ratio >= 3.0: intervention_score += 40
+    elif vol_ratio >= 1.5: intervention_score += 25
+    if position_score <= 0.2: intervention_score += 15
+    if has_dna: intervention_score += 10
+    
+    intervention_score = int(round(min(intervention_score, 100) / 10.0)) * 10
+    intervention_score = max(10, min(intervention_score, 90))
+    
+    intervention_comment = ""
+    if intervention_score >= 80: intervention_comment = "🚨 【極めて濃厚】大規模な資金流入のシグナルが点灯しています。"
+    elif intervention_score >= 50: intervention_comment = "👀 【予兆あり】平常時とは異なる資金の動きが観測されています。"
+    else: intervention_comment = "💤 【静観】現在は目立った資金流入の動きは検出されていません。"
 
-        warning_text = "【注意】※安全性を要確認" if deviation > 20 else ""
+    base_rank = "D"
+    if intervention_score >= 80 and (is_blue_sky or upside_potential >= 30): base_rank = "S"
+    elif intervention_score >= 70: base_rank = "A"
+    elif intervention_score >= 50 or (is_platinum and position_score <= 0.5): base_rank = "B"
+    else: base_rank = "C"
 
-        icons_list = []
-        if has_dna: icons_list.append("🧬")
-        if is_platinum: icons_list.append("💎")
-        if is_magma: icons_list.append("🦅")
-        icons_str = " ".join(icons_list)
+    warning_text = "【注意】※安全性を要確認" if deviation > 20 else ""
 
-        return {
-            "_status": "success",
-            "コード": code_only, "銘柄名": jp_name, "現在値": int(round(current_price)),
-            "時価総額": market_cap_oku, "時価総額_表示": formatted_mcap, "dividend_text": dividend_text,
-            "turnover_str": turnover_str, "ランク": base_rank, "警告": warning_text,
-            "乖離率": float(deviation), "hist": hist, "max_vol_price": float(max_vol_price),
-            "recent_20_low": float(recent_20_low), "star_rating": star_rating, "star_desc": star_desc,
-            "star_logic": star_logic, "intervention_name": intervention_name,
-            "intervention_score": intervention_score, "intervention_comment": intervention_comment,
-            "safe_judgment": safe_judgment, "safe_explain": safe_explain, "icons_str": icons_str
-        }
-    except Exception:
-        return _notice(
-            "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-            "上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
-        )
+    icons_list = []
+    if has_dna: icons_list.append("🧬")
+    if is_platinum: icons_list.append("💎")
+    if is_magma: icons_list.append("🦅")
+    icons_str = " ".join(icons_list)
 
+    # ★ 信用需給はキャッシュ外で取得するためここでは空値を設定
+    margin_str = None
+    margin_ratio = None
+    margin_buy = 0
+    margin_sell = 0
+    margin_buy_chg = 0
+    margin_sell_chg = 0
 
+    return {
+        "コード": code_only, "銘柄名": jp_name, "現在値": int(current_price),
+        "時価総額": market_cap_oku, "時価総額_表示": formatted_mcap, "dividend_text": dividend_text,
+        "turnover_str": turnover_str, "ランク": base_rank, "警告": warning_text,
+        "乖離率": deviation, "hist": hist, "max_vol_price": max_vol_price,
+        "recent_20_low": recent_20_low, "star_rating": star_rating, "star_desc": star_desc,
+        "star_logic": star_logic, "intervention_name": intervention_name,
+        "intervention_score": intervention_score, "intervention_comment": intervention_comment,
+        "safe_judgment": safe_judgment, "safe_explain": safe_explain, "icons_str": icons_str,
+        "margin_str": margin_str, "margin_ratio": margin_ratio,
+        "margin_buy": margin_buy, "margin_sell": margin_sell,
+        "margin_buy_change": margin_buy_chg, "margin_sell_change": margin_sell_chg,
+    }
+
+# 🚨 【呼び出し元関数】エラー時はキャッシュせずに例外を受け流す
 def evaluate_stock(ticker):
-    return _evaluate_stock_cached(ticker)
+    try:
+        return _evaluate_stock_cached(ticker)
+    except Exception:
+        return None
 
 def draw_chart(row, chart_key: str | None = None):
-    hist_data = _sanitize_hist_dataframe(row.get('hist'))
-    if hist_data is None or hist_data.empty:
-        st.info("チャート表示に必要なデータが不足しています。")
-        return
-
-    hist_data = hist_data.tail(150)
-    max_vol_price = safe_float(row.get('max_vol_price'), safe_float(hist_data['Close'].iloc[-1], 0.0))
-    recent_20_low = safe_float(row.get('recent_20_low'), safe_float(hist_data['Low'].min(), 0.0))
-
-    close_series = pd.to_numeric(hist_data['Close'], errors='coerce').dropna()
-    if len(close_series) >= 2 and close_series.nunique() > 1:
-        bins = min(15, int(close_series.nunique()))
-        hist_data_copy = hist_data.loc[close_series.index].copy()
-        hist_data_copy['price_bins'] = pd.cut(close_series, bins=bins)
-        vol_profile = hist_data_copy.groupby('price_bins', observed=False)['Volume'].sum()
-        bin_centers = [b.mid for b in vol_profile.index]
-        bin_volumes = vol_profile.values
-    else:
-        bin_centers = [safe_float(hist_data['Close'].iloc[-1], 0.0)]
-        bin_volumes = [safe_float(hist_data['Volume'].sum(), 0.0)]
-
+    hist_data = row['hist'].tail(150)
+    max_vol_price = row['max_vol_price']
+    recent_20_low = row['recent_20_low']
+    
+    bins = 15
+    hist_data_copy = hist_data.copy()
+    hist_data_copy['price_bins'] = pd.cut(hist_data_copy['Close'], bins=bins)
+    vol_profile = hist_data_copy.groupby('price_bins', observed=False)['Volume'].sum()
+    bin_centers = [b.mid for b in vol_profile.index]
+    bin_volumes = vol_profile.values
+    
     fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.85, 0.15], horizontal_spacing=0)
     fig.add_trace(go.Candlestick(x=hist_data.index, open=hist_data['Open'], high=hist_data['High'], low=hist_data['Low'], close=hist_data['Close'], name="株価", showlegend=False), row=1, col=1)
     fig.add_trace(go.Bar(x=bin_volumes, y=bin_centers, orientation='h', marker_color='rgba(255, 165, 0, 0.6)', name="出来高ボリューム", showlegend=False, hoverinfo='y'), row=1, col=2)
-
-    if max_vol_price > 0:
-        fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", 
-                      annotation_text=f" {int(round(max_vol_price))}円 🚧 需給の壁 ", 
-                      annotation_position="top left", annotation_font_color="orange", row=1, col=1)
-        fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", row=1, col=2)
-    if recent_20_low > 0:
-        fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", 
-                      annotation_text=f" 直近底値(1ヶ月) 🔵 {int(round(recent_20_low))}円 ", 
-                      annotation_position="bottom right", annotation_font_color="cyan", row=1, col=1)
-        fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", row=1, col=2)
+    
+    fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", 
+                  annotation_text=f" {int(max_vol_price)}円 🚧 需給の壁 ", 
+                  annotation_position="top left", annotation_font_color="orange", row=1, col=1)
+    fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", row=1, col=2)
+    
+    fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", 
+                  annotation_text=f" 直近底値(1ヶ月) 🔵 {int(recent_20_low)}円 ", 
+                  annotation_position="bottom right", annotation_font_color="cyan", row=1, col=1)
+    fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", row=1, col=2)
 
     fig.update_layout(
         title=f"{row['銘柄名']} 日足 ＆ 価格帯別出来高", 
@@ -1161,6 +1316,7 @@ def draw_chart(row, chart_key: str | None = None):
     )
     fig.update_xaxes(fixedrange=True); fig.update_yaxes(fixedrange=True)
     fig.update_xaxes(showticklabels=False, row=1, col=2)
+    
     if chart_key:
         try:
             st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=chart_key)
@@ -1195,6 +1351,20 @@ def render_card(ticker: str, d: Dict):
             tags_html += f'<span class="tag-watch">要監視</span>'
         else:
             tags_html += f'<span class="tag-normal">{tag}</span>'
+
+    # ★ 信用需給タグを追加
+    margin_ratio = d.get("margin_ratio")
+    if margin_ratio is not None and margin_ratio > 0:
+        if margin_ratio < 1.0:
+            mg_color = "#22C55E"  # 緑（売り優勢=踏み上げ期待）
+            mg_label = f"📊 売り優勢({margin_ratio:.1f}倍)"
+        elif margin_ratio <= 3.0:
+            mg_color = "#6B7280"  # グレー（拮抗）
+            mg_label = f"📊 需給拮抗({margin_ratio:.1f}倍)"
+        else:
+            mg_color = "#EF4444"  # 赤（買い残過多=上値重い）
+            mg_label = f"📊 買残多({margin_ratio:.1f}倍)"
+        tags_html += f'<span class="tag-normal" style="color:{mg_color};border-color:{mg_color};font-weight:700;" title="貸借倍率（信用買残÷信用売残）">{mg_label}</span>'
 
     score_text = f"{flow_score}"
     level_text = f"LEVEL {level}" if level > 0 else "LEVEL -"
@@ -1530,7 +1700,7 @@ def show_main_page():
         st.markdown("##### 🔍 気になる銘柄を入力")
         with st.form(key='search_form'):
             # 🌟 入力欄をコピペしやすくしつつ、高さを最小限に抑えて見た目を維持
-            input_code = st.text_area("銘柄コード", value=default_input, placeholder="例: 7011 7203\n改行やスペース区切りで複数入力できます", label_visibility="collapsed", height=68)
+            input_code = st.text_area("銘柄コード", value=default_input, placeholder="例: 7011 7203 151A\n改行やスペース区切りで複数入力できます", label_visibility="collapsed", height=68)
             search_btn = st.form_submit_button("🦅 ハゲタカAIで診断する")
             
         if search_btn and input_code:
@@ -1543,14 +1713,7 @@ def show_main_page():
                 with st.spinner(f'🦅 {len(codes)}銘柄を精密検査中...'):
                     for code in codes:
                         diag_data = evaluate_stock(f"{code}.T")
-                        if diag_data and diag_data.get("_status") == "notice":
-                            notice_text = (
-                                f"【 {code} 】 ご案内\n\n"
-                                f"{diag_data.get('message', 'この銘柄は現在診断対象外です。')}\n\n"
-                                f"{diag_data.get('detail', '')}"
-                            )
-                            st.info(notice_text)
-                        elif diag_data:
+                        if diag_data:
                             # 💡 診断結果をカードで囲んで区切りを明確に
                             with st.container():
                                 st.markdown('<div class="diagnosis-card-marker" style="display:none;"></div>', unsafe_allow_html=True)
@@ -1583,6 +1746,71 @@ def show_main_page():
                                     st.write(f"時価総額: **{diag_data['時価総額_表示']}**")
                                     st.write(f"配当情報: **{diag_data['dividend_text']}**")
                                     st.write(f"商い熱量: **{diag_data['turnover_str']}**")
+                                    # ★ 信用需給: KABU+ライブ → ratios.json の順でフォールバック
+                                    _diag_ticker = f"{code}.T"  # Bug修正: ticker→_diag_ticker（スコープ明確化）
+                                    try:
+                                        # Step1: KABU+ ライブ取得
+                                        _kp_margin = _load_kabuplus_margin()
+                                        _fetch_succeeded = len(_kp_margin) > 0  # 取得成功か（空＝週末・祝日等）
+                                        _in_margin_csv = _diag_ticker in _kp_margin  # CSVに銘柄が存在するか
+                                        _mg = _kp_margin.get(_diag_ticker, {})
+                                        _mg_ratio = _mg.get("margin_ratio")
+                                        _mg_buy  = int(_mg.get("margin_buy",  0) or 0)
+                                        _mg_sell = int(_mg.get("margin_sell", 0) or 0)
+
+                                        # Step2: KABU+が空（週末・祝日）または銘柄なし → ratios.json から取得
+                                        if not _fetch_succeeded or not _in_margin_csv:
+                                            _rdata = load_data()
+                                            for _bucket in ("data", "all_data"):
+                                                _item = (_rdata.get(_bucket) or {}).get(_diag_ticker, {})
+                                                if _item:
+                                                    _r = _item.get("margin_ratio")
+                                                    _b = int(_item.get("margin_buy",  0) or 0)
+                                                    _s = int(_item.get("margin_sell", 0) or 0)
+                                                    if _r or _b or _s:  # ratios.jsonにデータがあれば上書き
+                                                        _mg_ratio, _mg_buy, _mg_sell = _r, _b, _s
+                                                    break
+
+                                        # 表示文字列の決定
+                                        if _mg_ratio is not None and _mg_ratio > 0:
+                                            if _mg_ratio < 1.0:
+                                                _margin_str = f"📊 売り優勢（貸借倍率: {_mg_ratio:.2f}倍）買残{_mg_buy:,} / 売残{_mg_sell:,}"
+                                            elif _mg_ratio <= 3.0:
+                                                _margin_str = f"📊 拮抗（貸借倍率: {_mg_ratio:.2f}倍）買残{_mg_buy:,} / 売残{_mg_sell:,}"
+                                            else:
+                                                _margin_str = f"📊 買残過多（貸借倍率: {_mg_ratio:.2f}倍）買残{_mg_buy:,} / 売残{_mg_sell:,}"
+                                        elif _mg_buy > 0 and _mg_sell == 0:
+                                            # 信用売残ゼロ（倍率算出不可）だが買残は表示
+                                            _margin_str = f"📊 買残{_mg_buy:,}（売残なし・倍率算出不可）"
+                                        elif _mg_buy > 0 or _mg_sell > 0:
+                                            _margin_str = f"📊 買残{_mg_buy:,} / 売残{_mg_sell:,}"
+                                        elif not _fetch_succeeded:
+                                            # KABU+取得自体が失敗（週末・祝日・ネットワーク等）
+                                            _margin_str = "📊 取得不可（週末・祝日はデータなし）"
+                                        elif _in_margin_csv:
+                                            # CSVには存在するが残高ゼロ
+                                            _margin_str = "📊 残高なし（信用取引不活発）"
+                                        else:
+                                            # CSVに存在しない＝貸借銘柄でない or 信用取引不可
+                                            _margin_str = "📊 対象外（貸借銘柄でない可能性）"
+                                    except Exception as _e:
+                                        print(f"⚠️ [margin display] {_diag_ticker}: {_e}")
+                                        _margin_str = "📊 データなし"
+                                    st.write(f"信用需給: **{_margin_str}**")
+                                    
+                                    with st.expander("💡 信用需給（貸借倍率）の見方", key=f"diag_exp_margin_{code}"):
+                                        st.markdown("""
+                                        **貸借倍率 ＝ 信用買残 ÷ 信用売残**
+                                        
+                                        信用取引の需給バランスから、今後の株価の方向性を推測するための指標です。
+                                        
+                                        * **1.0倍未満【売り優勢】** 空売りが多い状態。株価上昇時に「踏み上げ」（ショートカバー）が発生し、急騰のトリガーになることがあります。
+                                        * **1.0〜3.0倍【拮抗】** 標準的な需給バランス。特段の偏りはなく、他の指標と合わせて判断します。
+                                        * **3.0倍超【買残過多】** 信用買いが過剰に積み上がっている状態。将来の売り圧力（返済売り）となり、上値が重くなりやすい傾向があります。
+                                        * **前週比の変化にも注目** 買残の急増は「個人投資家の過熱」、売残の急増は「機関投資家のヘッジ」を示唆することがあります。
+                                        
+                                        ※信用残高は毎週金曜日に更新されるデータです。
+                                        """)
                                     
                                     with st.expander("💡 商い熱量（株式回転率）とは？", key=f"diag_exp_turnover_{code}"):
                                         st.markdown("""
@@ -1637,8 +1865,9 @@ def show_main_page():
                                         st.markdown(safe_explain_html, unsafe_allow_html=True)
 
                                 draw_chart(diag_data, chart_key=f"hagetaka_chart_{code}")
-                        else:
-                            st.info("【 {} 】 ご案内\n\nこの銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。\n\n上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。".format(code))
+                        else: 
+                            # 🚨 ここが確実に表示されるように修正
+                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。\n\n※存在しない銘柄、または**アクセス集中による一時的な通信制限**の可能性があります。しばらく時間を空けてから再度お試しください。")
 
     # ==========================================
     # タブ3: 通知設定
