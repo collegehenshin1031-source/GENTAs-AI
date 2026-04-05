@@ -76,6 +76,8 @@ LEVEL_COLORS = {4: "#C41E3A", 3: "#FF9800", 2: "#FFC107", 1: "#5C6BC0", 0: "#9E9
 
 MASTER_PASSWORD = "88888"
 DISCLAIMER_TEXT = "本ツールは市場データの可視化を目的とした補助ツールです。<br>銘柄推奨・売買助言ではありません。最終判断は利用者ご自身で行ってください。"
+MIGRATION_URL = "https://gentas-aiv3-production.up.railway.app/"
+MIGRATION_LABEL = "源太AIはこちらへ移行しました"
 
 # ==========================================
 # 【最強の通信セッション構築】
@@ -193,6 +195,85 @@ div[data-testid="stAppViewContainer"]{
 .main .block-container{ max-width: 1080px !important; padding: 2.0rem 1.2rem 3.2rem 1.2rem !important; }
 h1{ text-align:center !important; font-size: 1.55rem !important; font-weight: 800 !important; margin-bottom: .2rem !important; }
 .subtitle{ text-align:center; color: var(--text-color); opacity: 0.7; font-size:.85rem; margin-bottom: 1.1rem; }
+
+/* 移行案内バナー */
+.migration-banner {
+  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.08));
+  border: 1px solid rgba(37,99,235,0.28);
+  border-radius: 18px;
+  padding: 1rem 1.1rem;
+  margin: 0.4rem 0 1.1rem 0;
+  box-shadow: 0 8px 24px rgba(37,99,235,0.10);
+}
+.migration-banner.sticky {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 40;
+  backdrop-filter: blur(8px);
+}
+.migration-banner-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.migration-copy {
+  min-width: 0;
+}
+.migration-eyebrow {
+  display: inline-block;
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: #1d4ed8;
+  background: rgba(255,255,255,0.55);
+  border-radius: 999px;
+  padding: 0.22rem 0.6rem;
+  margin-bottom: 0.45rem;
+}
+.migration-title {
+  font-size: 1.02rem;
+  font-weight: 800;
+  line-height: 1.45;
+  color: var(--text-color);
+  margin: 0 0 0.18rem 0;
+}
+.migration-sub {
+  font-size: 0.84rem;
+  opacity: 0.78;
+  margin: 0;
+}
+.migration-cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  text-decoration: none !important;
+  font-weight: 800;
+  font-size: 0.95rem;
+  color: #ffffff !important;
+  background: linear-gradient(135deg, #2563eb, #0ea5e9);
+  padding: 0.9rem 1.15rem;
+  border-radius: 14px;
+  box-shadow: 0 10px 22px rgba(37,99,235,0.22);
+}
+.migration-cta:hover {
+  filter: brightness(1.03);
+}
+.migration-inline-link {
+  display: inline-block;
+  margin-top: 0.45rem;
+  font-size: 0.78rem;
+  word-break: break-all;
+  color: #1d4ed8 !important;
+  text-decoration: none !important;
+}
+@media (max-width: 768px) {
+  .migration-banner { padding: 0.95rem 0.9rem; border-radius: 16px; }
+  .migration-banner-inner { flex-direction: column; align-items: stretch; }
+  .migration-title { font-size: 0.95rem; }
+  .migration-cta { width: 100%; }
+}
 
 /* 🌟 ライトモード時のロゴ（背景透過） */
 .logo-img { mix-blend-mode: multiply; transition: all 0.3s ease; }
@@ -1408,9 +1489,27 @@ def render_card(ticker: str, d: Dict):
 # ==========================================
 # 画面遷移
 # ==========================================
+def render_migration_banner(sticky: bool = False, compact: bool = False):
+    sticky_cls = " sticky" if sticky else ""
+    subtitle = "今後のご利用は新しい源太AIからお願いいたします。" if not compact else "新しい源太AIへそのまま進めます。"
+    st.markdown(f"""
+    <div class="migration-banner{sticky_cls}">
+        <div class="migration-banner-inner">
+            <div class="migration-copy">
+                <div class="migration-eyebrow">お知らせ</div>
+                <div class="migration-title">{MIGRATION_LABEL}「{MIGRATION_URL}」</div>
+                <p class="migration-sub">{subtitle}</p>
+                <a class="migration-inline-link" href="{MIGRATION_URL}" target="_blank">{MIGRATION_URL}</a>
+            </div>
+            <a class="migration-cta" href="{MIGRATION_URL}" target="_blank">新しい源太AIを開く ↗</a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
 def show_login_page():
     logo_base64 = get_logo_base64()
-    st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
+    render_migration_banner(sticky=True)
     
     _, col2, _ = st.columns([1, 2, 1])
     with col2:
@@ -1456,6 +1555,7 @@ def show_login_page():
                     st.rerun()
 
 def show_main_page():
+    render_migration_banner(sticky=True, compact=True)
     if "flt_level_select" not in st.session_state:
         st.session_state["flt_level_select"] = "すべて"
     if "flt_watch_only" not in st.session_state:
@@ -1476,6 +1576,7 @@ def show_main_page():
     # タブ1: M&A候補
     # ==========================================
     with tab1:
+        render_migration_banner(compact=True)
         with st.expander("💡 LEVELと需給スコアの見方", expanded=False):
             st.markdown("""
             **■ LEVEL（0〜4）**
@@ -1875,6 +1976,7 @@ def show_main_page():
     # タブ3: 通知設定
     # ==========================================
     with tab3:
+        render_migration_banner(compact=True)
         st.markdown("### 🔔 メール通知設定")
         st.info("※設定したメールアドレス宛に、毎日の分析結果（該当銘柄がある場合のみ）が自動送信されます。")
         current_email = st.session_state.get("email_address", "")
