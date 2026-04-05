@@ -1925,4 +1925,3 @@ if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
 if "cart" not in st.session_state: st.session_state["cart"] = []
 if st.session_state.get("logged_in"): show_main_page()
 else: show_login_page()
-　
