@@ -876,20 +876,24 @@ def _evaluate_stock_cached(ticker):
             hist, info = _fetch_yf_data_with_retry(ticker)
 
         hist = _sanitize_hist_dataframe(hist)
-        if hist is None or hist.empty or len(hist) < 5:
-            return _notice(
-                "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
-            )
+if hist is None or hist.empty or len(hist) < 5:
+    return _notice(
+        "この銘柄は現在、判定に必要なデータを確認中です。",
+        "少し時間を置いて再度お試しください。\n"
+        "※銘柄コードの入力に誤りがある場合、正しく表示されません。\n"
+        "※判定に必要なデータが不足している場合、結果を表示できない事があります。"
+    )
 
         current_price = safe_float(hist["Close"].iloc[-1], np.nan)
-        current_vol = safe_float(hist["Volume"].iloc[-1], 0.0)
-        avg_vol_100 = safe_float(hist["Volume"].tail(100).mean() if len(hist) >= 100 else hist["Volume"].mean(), 0.0)
-        if pd.isna(current_price) or current_price <= 0:
-            return _notice(
-                "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-                "価格データが安定して取得できないため、診断結果を表示していません。"
-            )
+current_vol = safe_float(hist["Volume"].iloc[-1], 0.0)
+avg_vol_100 = safe_float(hist["Volume"].tail(100).mean() if len(hist) >= 100 else hist["Volume"].mean(), 0.0)
+if pd.isna(current_price) or current_price <= 0:
+    return _notice(
+        "この銘柄は現在、判定に必要なデータを確認中です。",
+        "少し時間を置いて再度お試しください。\n"
+        "※銘柄コードの入力に誤りがある場合、正しく表示されません。\n"
+        "※判定に必要なデータが不足している場合、結果を表示できない事があります。"
+    )
 
         market_cap = safe_float((info or {}).get('marketCap'), 0.0)
         shares = safe_float((info or {}).get('sharesOutstanding'), 0.0)
@@ -1108,10 +1112,12 @@ def _evaluate_stock_cached(ticker):
             "safe_judgment": safe_judgment, "safe_explain": safe_explain, "icons_str": icons_str
         }
     except Exception:
-        return _notice(
-            "この銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。",
-            "上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。"
-        )
+    return _notice(
+        "この銘柄は現在、判定に必要なデータを確認中です。",
+        "少し時間を置いて再度お試しください。\n"
+        "※銘柄コードの入力に誤りがある場合、正しく表示されません。\n"
+        "※判定に必要なデータが不足している場合、結果を表示できない事があります。"
+    )
 
 
 def evaluate_stock(ticker):
@@ -1638,8 +1644,13 @@ def show_main_page():
 
                                 draw_chart(diag_data, chart_key=f"hagetaka_chart_{code}")
                         else:
-                            st.info("【 {} 】 ご案内\n\nこの銘柄は、現時点では判断材料が少ないため、源太AIの監視対象外です。\n\n上場直後の銘柄や、分析に必要なデータが十分でない銘柄は、診断結果を表示できない場合があります。".format(code))
-
+                            st.info(
+    "【 {} 】 ご案内\n\n"
+    "この銘柄は現在、判定に必要なデータを確認中です。\n"
+    "少し時間を置いて再度お試しください。\n\n"
+    "※銘柄コードの入力に誤りがある場合、正しく表示されません。\n"
+    "※判定に必要なデータが不足している場合、結果を表示できない事があります。".format(code)
+)
     # ==========================================
     # タブ3: 通知設定
     # ==========================================
