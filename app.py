@@ -1867,7 +1867,9 @@ def show_main_page():
                                 draw_chart(diag_data, chart_key=f"hagetaka_chart_{code}")
                         else: 
                             # 🚨 ここが確実に表示されるように修正
-                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。\n\n※存在しない銘柄、または**アクセス集中による一時的な通信制限**の可能性があります。しばらく時間を空けてから再度お試しください。")
+                            st.info(
+                                f"【 {code} 】\n\nこの銘柄は現在、判定に必要なデータを確認中です。\n少し時間を置いて再度お試しください。\n\n※銘柄コードの入力に誤りがある場合、正しく表示されません。\n※判定に必要なデータが不足している場合、結果を表示できない事があります。"
+                            )
 
     # ==========================================
     # タブ3: 通知設定
@@ -1923,3 +1925,4 @@ if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
 if "cart" not in st.session_state: st.session_state["cart"] = []
 if st.session_state.get("logged_in"): show_main_page()
 else: show_login_page()
+　
