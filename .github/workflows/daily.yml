@@ -1,5 +1,4 @@
 # 平日 JST 16:30 頃開始: JPX 全銘柄スキャン → ratios.json + data/history/shard_*.json 更新
-# デメリット: 実行に 1〜数時間かかることがある / Yahoo 側の制限で一部銘柄欠損の可能性あり
 name: Daily Fetch (Full Universe)
 
 on:
@@ -11,12 +10,14 @@ permissions:
   contents: write
 
 env:
+  KABUPLUS_ID: ${{ secrets.KABUPLUS_ID }}
+  KABUPLUS_PASSWORD: ${{ secrets.KABUPLUS_PASSWORD }}
   FULL_UNIVERSE: "1"
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
@@ -35,6 +36,9 @@ jobs:
           pip install -r requirements.txt
 
       - name: Fetch volume data (JPX universe)
+        env:
+          KABUPLUS_ID: ${{ secrets.KABUPLUS_ID }}
+          KABUPLUS_PASSWORD: ${{ secrets.KABUPLUS_PASSWORD }}
         run: python fetch_data.py
 
       - name: Commit and push changes
