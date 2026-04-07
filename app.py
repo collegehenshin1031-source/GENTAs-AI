@@ -76,8 +76,6 @@ LEVEL_COLORS = {4: "#C41E3A", 3: "#FF9800", 2: "#FFC107", 1: "#5C6BC0", 0: "#9E9
 
 MASTER_PASSWORD = "88888"
 DISCLAIMER_TEXT = "本ツールは市場データの可視化を目的とした補助ツールです。<br>銘柄推奨・売買助言ではありません。最終判断は利用者ご自身で行ってください。"
-MIGRATION_URL = "https://gentas-aiv3-production.up.railway.app/"
-MIGRATION_LABEL = "源太AIは移行しました。"
 
 # ==========================================
 # 【最強の通信セッション構築】
@@ -113,7 +111,6 @@ yf_session = get_yf_session()
 # ==========================================
 # 【KABU+ 一括データ】診断用の銘柄情報キャッシュ
 # ==========================================
-@st.cache_data(ttl=900, show_spinner=False)
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_kabuplus_info() -> dict:
     """KABU+ から全銘柄の指標データを一括取得し info 辞書を構築（1時間キャッシュ）"""
@@ -135,22 +132,42 @@ def _get_kabuplus_info(ticker: str) -> dict:
     return _load_kabuplus_info().get(ticker, {})
 
 
-@st.cache_data(ttl=21600, show_spinner=False)  # 6時間キャッシュ（週次データなので長めに保持）
 def _load_kabuplus_margin() -> dict:
     """KABU+ から全銘柄の信用残高データを一括取得し辞書を構築。
     信用残高は週次（金曜日更新）のため、直近金曜のCSVを優先取得する。
+    取得成功時のみ session_state にキャッシュ（6時間）。
+    空データはキャッシュしないことで、再起動なしに次回取得を試みる。
     """
+    import time
+    CACHE_KEY = "_margin_cache"
+    CACHE_TS   = "_margin_cache_ts"
+    TTL = 21600  # 6時間（週次データ）
+
+    # session_state キャッシュヒット確認
+    now = time.time()
+    cached = st.session_state.get(CACHE_KEY)
+    cached_ts = st.session_state.get(CACHE_TS, 0)
+    if cached is not None and (now - cached_ts) < TTL:
+        return cached
+
+    # KABU+ から取得
     try:
         uid, pwd = kp.get_credentials()
         if not uid or not pwd:
             return {}
         margin_df = kp.fetch_margin_data(uid, pwd)
         if margin_df.empty:
-            return {}
-        return kp.build_margin_lookup(margin_df)
+            print("⚠️ [_load_kabuplus_margin] KABU+信用残高CSV空（金曜CSVが未公開の可能性）")
+            return {}  # 空はキャッシュしない
+        result = kp.build_margin_lookup(margin_df)
+        if result:
+            st.session_state[CACHE_KEY] = result
+            st.session_state[CACHE_TS]  = now
+            print(f"✅ [_load_kabuplus_margin] {len(result)}銘柄 取得・キャッシュ完了")
+        return result
     except Exception as e:
         print(f"⚠️ [_load_kabuplus_margin] 取得失敗: {e}")
-        return {}
+        return {}  # 空はキャッシュしない
 
 # ==========================================
 # カート操作のコールバック関数（即時反映用）
@@ -195,85 +212,6 @@ div[data-testid="stAppViewContainer"]{
 .main .block-container{ max-width: 1080px !important; padding: 2.0rem 1.2rem 3.2rem 1.2rem !important; }
 h1{ text-align:center !important; font-size: 1.55rem !important; font-weight: 800 !important; margin-bottom: .2rem !important; }
 .subtitle{ text-align:center; color: var(--text-color); opacity: 0.7; font-size:.85rem; margin-bottom: 1.1rem; }
-
-/* 移行案内バナー */
-.migration-banner {
-  background: linear-gradient(135deg, rgba(37,99,235,0.12), rgba(14,165,233,0.08));
-  border: 1px solid rgba(37,99,235,0.28);
-  border-radius: 18px;
-  padding: 1rem 1.1rem;
-  margin: 0.4rem 0 1.1rem 0;
-  box-shadow: 0 8px 24px rgba(37,99,235,0.10);
-}
-.migration-banner.sticky {
-  position: sticky;
-  top: 0.75rem;
-  z-index: 40;
-  backdrop-filter: blur(8px);
-}
-.migration-banner-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
-.migration-copy {
-  min-width: 0;
-}
-.migration-eyebrow {
-  display: inline-block;
-  font-size: 0.74rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  color: #1d4ed8;
-  background: rgba(255,255,255,0.55);
-  border-radius: 999px;
-  padding: 0.22rem 0.6rem;
-  margin-bottom: 0.45rem;
-}
-.migration-title {
-  font-size: 1.02rem;
-  font-weight: 800;
-  line-height: 1.45;
-  color: var(--text-color);
-  margin: 0 0 0.18rem 0;
-}
-.migration-sub {
-  font-size: 0.84rem;
-  opacity: 0.78;
-  margin: 0;
-}
-.migration-cta {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  white-space: nowrap;
-  text-decoration: none !important;
-  font-weight: 800;
-  font-size: 0.95rem;
-  color: #ffffff !important;
-  background: linear-gradient(135deg, #2563eb, #0ea5e9);
-  padding: 0.9rem 1.15rem;
-  border-radius: 14px;
-  box-shadow: 0 10px 22px rgba(37,99,235,0.22);
-}
-.migration-cta:hover {
-  filter: brightness(1.03);
-}
-.migration-inline-link {
-  display: inline-block;
-  margin-top: 0.45rem;
-  font-size: 0.78rem;
-  word-break: break-all;
-  color: #1d4ed8 !important;
-  text-decoration: none !important;
-}
-@media (max-width: 768px) {
-  .migration-banner { padding: 0.95rem 0.9rem; border-radius: 16px; }
-  .migration-banner-inner { flex-direction: column; align-items: stretch; }
-  .migration-title { font-size: 0.95rem; }
-  .migration-cta { width: 100%; }
-}
 
 /* 🌟 ライトモード時のロゴ（背景透過） */
 .logo-img { mix-blend-mode: multiply; transition: all 0.3s ease; }
@@ -531,70 +469,171 @@ def load_data() -> Dict:
 
     return data
 
-def get_fernet() -> Fernet: return Fernet(st.secrets["encryption"]["key"].encode())
-def encrypt_password(pw: str) -> str: return get_fernet().encrypt(pw.encode()).decode() if pw else ""
-def decrypt_password(pw: str) -> str: 
-    try: return get_fernet().decrypt(pw.encode()).decode() if pw else ""
-    except: return ""
-
-def get_gsheets_connection(): return st.connection("gsheets", type=GSheetsConnection)
-
-def load_settings_by_email(email: str) -> Optional[Dict]:
-    if not email: return None
+def _get_secret_value(section: str, key: str, env_name: str | None = None, default=None):
+    import os
+    if env_name:
+        env_val = os.getenv(env_name)
+        if env_val not in (None, ""):
+            return env_val
     try:
-        df = get_gsheets_connection().read(worksheet="settings", usecols=[0, 1], ttl=0)
-        if df is None or df.empty: return None
-        df.columns = ["email", "encrypted_password"]
-        row = df[df["email"].str.lower().str.strip() == email.lower().strip()]
-        if row.empty: return None
-        return {"email": row.iloc[0]["email"], "encrypted_password": row.iloc[0]["encrypted_password"]}
-    except:
-        st.cache_data.clear()
-        return None
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+
+def _get_gsheets_config() -> Dict:
+    import os
+    import ast
+
+    raw = os.getenv("GSHEETS_CREDENTIALS")
+    if raw:
+        parsed = None
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+
+        if not isinstance(parsed, dict):
+            try:
+                maybe = ast.literal_eval(raw)
+                if isinstance(maybe, dict):
+                    parsed = maybe
+            except Exception:
+                parsed = None
+
+        if isinstance(parsed, dict):
+            pk = parsed.get("private_key")
+            if isinstance(pk, str):
+                parsed["private_key"] = pk.replace("\r\n", "\n").replace("\r", "\n")
+            parsed["spreadsheet"] = os.getenv("SPREADSHEET_URL", parsed.get("spreadsheet", ""))
+            parsed.setdefault("worksheet", os.getenv("GSHEETS_WORKSHEET", "settings"))
+            return parsed
+
+    try:
+        cfg = dict(st.secrets["connections"]["gsheets"])
+        cfg.setdefault("worksheet", cfg.get("worksheet") or "settings")
+        return cfg
+    except Exception:
+        return {}
+
+
+def get_fernet() -> Fernet:
+    key = _get_secret_value("encryption", "key", env_name="ENCRYPTION_KEY")
+    if not key:
+        raise ValueError("ENCRYPTION_KEY が未設定です")
+    return Fernet(key.encode())
+
+
+def encrypt_password(pw: str) -> str:
+    return get_fernet().encrypt(pw.encode()).decode() if pw else ""
+
+
+def decrypt_password(pw: str) -> str:
+    try:
+        return get_fernet().decrypt(pw.encode()).decode() if pw else ""
+    except Exception:
+        return ""
+
+
+def get_gsheets_connection():
+    return st.connection("gsheets", type=GSheetsConnection)
+
 
 def get_gspread_client():
     try:
-        cd = dict(st.secrets["connections"]["gsheets"])
-        cd.pop("spreadsheet", None); cd.pop("worksheet", None)
-        creds = Credentials.from_service_account_info(cd, scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"])
+        cd = dict(_get_gsheets_config())
+        cd.pop("spreadsheet", None)
+        cd.pop("worksheet", None)
+        creds = Credentials.from_service_account_info(
+            cd,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
         return gspread.authorize(creds)
-    except: return None
+    except Exception:
+        return None
+
+
+def _get_settings_worksheet_name() -> str:
+    return str(_get_gsheets_config().get("worksheet") or "settings")
+
+
+def _get_spreadsheet_url() -> str:
+    return str(_get_gsheets_config().get("spreadsheet") or "")
+
+
+def load_settings_by_email(email: str) -> Optional[Dict]:
+    if not email:
+        return None
+    try:
+        client = get_gspread_client()
+        url = _get_spreadsheet_url()
+        if not client or not url:
+            return None
+        ws = client.open_by_url(url).worksheet(_get_settings_worksheet_name())
+        values = ws.get_all_values()
+        if not values:
+            return None
+        for row in values:
+            if len(row) >= 2 and str(row[0]).lower().strip() == email.lower().strip():
+                return {"email": row[0], "encrypted_password": row[1]}
+        return None
+    except Exception:
+        st.cache_data.clear()
+        return None
+
 
 def save_settings_to_sheet(email: str, app_password: str) -> bool:
-    if not email: return False
+    if not email:
+        return False
     email = email.lower().strip()
     try:
         client = get_gspread_client()
-        if not client: return False
-        url = st.secrets["connections"]["gsheets"].get("spreadsheet")
-        ws = client.open_by_url(url).worksheet("settings")
+        url = _get_spreadsheet_url()
+        if not client or not url:
+            return False
+        ws = client.open_by_url(url).worksheet(_get_settings_worksheet_name())
         enc_pw = encrypt_password(app_password)
-        try: all_emails = ws.col_values(1)
-        except: all_emails = []
+        try:
+            all_emails = ws.col_values(1)
+        except Exception:
+            all_emails = []
         row_index = next((i + 1 for i, ce in enumerate(all_emails) if ce and ce.lower().strip() == email), -1)
-        if row_index > 1: ws.update_cell(row_index, 2, enc_pw)
-        else: ws.append_row([email, enc_pw])
+        if row_index > 1:
+            ws.update_cell(row_index, 2, enc_pw)
+        else:
+            ws.append_row([email, enc_pw])
         st.cache_data.clear()
         return True
-    except: return False
+    except Exception:
+        return False
+
 
 def delete_settings_from_sheet(email: str) -> bool:
-    if not email: return False
+    if not email:
+        return False
     email = email.lower().strip()
     try:
         client = get_gspread_client()
-        if not client: return False
-        url = st.secrets["connections"]["gsheets"].get("spreadsheet")
-        ws = client.open_by_url(url).worksheet("settings")
-        try: all_emails = ws.col_values(1)
-        except: all_emails = []
+        url = _get_spreadsheet_url()
+        if not client or not url:
+            return False
+        ws = client.open_by_url(url).worksheet(_get_settings_worksheet_name())
+        try:
+            all_emails = ws.col_values(1)
+        except Exception:
+            all_emails = []
         row_index = next((i + 1 for i, ce in enumerate(all_emails) if ce and ce.lower().strip() == email), -1)
         if row_index > 1:
             ws.delete_rows(row_index)
             st.cache_data.clear()
             return True
         return False
-    except: return False
+    except Exception:
+        return False
 
 def send_test_email(email: str, app_password: str) -> tuple[bool, str]:
     try:
@@ -1000,7 +1039,8 @@ def _fetch_yahoo_chart_api(ticker: str) -> pd.DataFrame | None:
             return None
         df["Volume"] = df["Volume"].fillna(0)
         return df
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ [_fetch_yahoo_chart_api] {ticker}: {type(e).__name__}: {e}")
         return None
 
 
@@ -1048,7 +1088,8 @@ def _fetch_kabuoji3(ticker: str) -> pd.DataFrame | None:
         df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
         df["Volume"] = df["Volume"].fillna(0)
         return df if len(df) >= 5 else None
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ [_fetch_kabuoji3] {ticker}: {type(e).__name__}: {e}")
         return None
 
 
@@ -1361,50 +1402,263 @@ def _evaluate_stock_cached(ticker):
 def evaluate_stock(ticker):
     try:
         return _evaluate_stock_cached(ticker)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ [evaluate_stock] {ticker} 取得失敗: {type(e).__name__}: {e}")
         return None
 
-def draw_chart(row, chart_key: str | None = None):
-    hist_data = row['hist'].tail(150)
-    max_vol_price = row['max_vol_price']
-    recent_20_low = row['recent_20_low']
-    
-    bins = 15
-    hist_data_copy = hist_data.copy()
-    hist_data_copy['price_bins'] = pd.cut(hist_data_copy['Close'], bins=bins)
-    vol_profile = hist_data_copy.groupby('price_bins', observed=False)['Volume'].sum()
-    bin_centers = [b.mid for b in vol_profile.index]
-    bin_volumes = vol_profile.values
-    
-    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.85, 0.15], horizontal_spacing=0)
-    fig.add_trace(go.Candlestick(x=hist_data.index, open=hist_data['Open'], high=hist_data['High'], low=hist_data['Low'], close=hist_data['Close'], name="株価", showlegend=False), row=1, col=1)
-    fig.add_trace(go.Bar(x=bin_volumes, y=bin_centers, orientation='h', marker_color='rgba(255, 165, 0, 0.6)', name="出来高ボリューム", showlegend=False, hoverinfo='y'), row=1, col=2)
-    
-    fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", 
-                  annotation_text=f" {int(max_vol_price)}円 🚧 需給の壁 ", 
-                  annotation_position="top left", annotation_font_color="orange", row=1, col=1)
-    fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", row=1, col=2)
-    
-    fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", 
-                  annotation_text=f" 直近底値(1ヶ月) 🔵 {int(recent_20_low)}円 ", 
-                  annotation_position="bottom right", annotation_font_color="cyan", row=1, col=1)
-    fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", row=1, col=2)
+def _is_mobile_client() -> bool:
+    """ブラウザのUser-Agentからスマホ/タブレット系アクセスをざっくり判定。"""
+    try:
+        headers = getattr(st.context, "headers", {}) or {}
+        user_agent = ""
+        for key in ("user-agent", "User-Agent"):
+            if key in headers:
+                user_agent = str(headers.get(key, ""))
+                break
 
-    fig.update_layout(
-        title=f"{row['銘柄名']} 日足 ＆ 価格帯別出来高", 
-        xaxis_rangeslider_visible=False, height=350, margin=dict(l=0, r=0, t=30, b=0), dragmode=False,
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
-    )
-    fig.update_xaxes(fixedrange=True); fig.update_yaxes(fixedrange=True)
-    fig.update_xaxes(showticklabels=False, row=1, col=2)
-    
+        ua = user_agent.lower()
+        mobile_keywords = [
+            "iphone", "ipod", "ipad", "android", "mobile",
+            "windows phone", "webos", "blackberry"
+        ]
+        return any(keyword in ua for keyword in mobile_keywords)
+    except Exception:
+        return False
+
+
+def _normalize_chart_hist_for_split(hist: pd.DataFrame) -> tuple[pd.DataFrame, dict | None]:
+    """
+    株式分割・併合のような急激な価格スケール変化が描画期間内に混ざると、
+    ライン注釈やY軸が極端に圧縮されてスマホ表示が崩れる。
+    そのため、表示用チャートだけは不連続点を検知して過去データを現在スケールへ補正する。
+    """
+    if hist is None or hist.empty or len(hist) < 10:
+        return hist, None
+
+    out = hist.copy()
+    closes = pd.to_numeric(out["Close"], errors="coerce")
+    ratios = closes / closes.shift(1)
+    ratios = ratios.replace([np.inf, -np.inf], np.nan).dropna()
+    if ratios.empty:
+        return out, None
+
+    # 一般的な分割・併合比率に寄せて判定
+    candidate_factors = np.array([0.1, 0.2, 0.25, 1/3, 0.5, 2.0, 3.0, 4.0, 5.0, 10.0], dtype=float)
+    log_candidates = np.log(candidate_factors)
+
+    best_idx = None
+    best_factor = None
+    best_score = None
+
+    for idx, ratio in ratios.items():
+        if ratio <= 0:
+            continue
+        log_ratio = np.log(float(ratio))
+        nearest_pos = int(np.argmin(np.abs(log_candidates - log_ratio)))
+        nearest_factor = float(candidate_factors[nearest_pos])
+        distance = float(abs(log_candidates[nearest_pos] - log_ratio))
+        # 通常の値動きでは起きにくい大きな不連続だけ拾う
+        if distance <= 0.18 and (nearest_factor <= 0.55 or nearest_factor >= 1.8):
+            score = abs(log_ratio)
+            if best_score is None or score > best_score:
+                best_idx = idx
+                best_factor = nearest_factor
+                best_score = score
+
+    if best_idx is None or best_factor is None:
+        return out, None
+
+    prev_mask = out.index < best_idx
+    if not prev_mask.any():
+        return out, None
+
+    for col in ["Open", "High", "Low", "Close"]:
+        out.loc[prev_mask, col] = pd.to_numeric(out.loc[prev_mask, col], errors="coerce") * best_factor
+
+    # 分割前の出来高は現在株数ベースへ寄せる
+    vol_factor = 1.0 / best_factor if best_factor != 0 else 1.0
+    out.loc[prev_mask, "Volume"] = pd.to_numeric(out.loc[prev_mask, "Volume"], errors="coerce").fillna(0) * vol_factor
+
+    info = {
+        "split_date": pd.Timestamp(best_idx),
+        "factor": float(best_factor),
+    }
+    return out, info
+
+
+def _calc_local_profile_levels(hist_data: pd.DataFrame, bins: int = 15) -> tuple[float, float]:
+    local_recent_low = float(pd.to_numeric(hist_data["Low"], errors="coerce").tail(20).min())
+
+    closes = pd.to_numeric(hist_data["Close"], errors="coerce")
+    if closes.nunique(dropna=True) > 1:
+        price_bins = pd.cut(closes, bins=bins)
+        vol_profile = hist_data.assign(price_bins=price_bins).groupby("price_bins", observed=False)["Volume"].sum()
+        try:
+            local_max_vol_price = float(vol_profile.idxmax().mid)
+        except Exception:
+            local_max_vol_price = float(closes.iloc[-1])
+    else:
+        local_max_vol_price = float(closes.iloc[-1])
+
+    return local_max_vol_price, local_recent_low
+
+
+def draw_chart(row, chart_key: str | None = None):
+    is_mobile = _is_mobile_client()
+    raw_hist = row['hist'].tail(90 if is_mobile else 150).copy()
+    hist_data, split_info = _normalize_chart_hist_for_split(raw_hist)
+
+    bins = 12 if is_mobile else 15
+    max_vol_price, recent_20_low = _calc_local_profile_levels(hist_data, bins=bins)
+
+    hist_data['price_bins'] = pd.cut(pd.to_numeric(hist_data['Close'], errors='coerce'), bins=bins)
+    vol_profile = hist_data.groupby('price_bins', observed=False)['Volume'].sum()
+    bin_centers = [float(b.mid) for b in vol_profile.index]
+    bin_labels = [f"{int(round(center))}円" for center in bin_centers]
+    bin_volumes = vol_profile.fillna(0).values
+
+    visible_min = float(np.nanmin([hist_data['Low'].min(), max_vol_price, recent_20_low]))
+    visible_max = float(np.nanmax([hist_data['High'].max(), max_vol_price, recent_20_low]))
+    pad = max((visible_max - visible_min) * 0.08, max(visible_max, 1) * 0.02)
+    y_range = [visible_min - pad, visible_max + pad]
+
+    split_note = None
+    if split_info:
+        factor = split_info['factor']
+        split_date = split_info['split_date']
+        if factor < 1:
+            split_note = f"表示期間内に株式分割相当の価格段差を検知したため、{split_date:%Y-%m-%d}以前を現在株価ベースへ補正して表示しています。"
+        else:
+            split_note = f"表示期間内に株式併合相当の価格段差を検知したため、{split_date:%Y-%m-%d}以前を現在株価ベースへ補正して表示しています。"
+
+    if is_mobile:
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=False,
+            vertical_spacing=0.08,
+            row_heights=[0.68, 0.32]
+        )
+        fig.add_trace(
+            go.Candlestick(
+                x=hist_data.index,
+                open=hist_data['Open'], high=hist_data['High'],
+                low=hist_data['Low'], close=hist_data['Close'],
+                name="株価", showlegend=False
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Bar(
+                x=bin_labels, y=bin_volumes,
+                marker_color='rgba(255, 165, 0, 0.65)',
+                name="価格帯別売買高",
+                showlegend=False,
+                hovertemplate="価格帯: %{x}<br>出来高: %{y:,}<extra></extra>"
+            ),
+            row=2, col=1
+        )
+
+        fig.add_hline(
+            y=max_vol_price, line_width=2, line_dash="dash", line_color="orange",
+            annotation_text=f"需給の壁 {int(max_vol_price)}円",
+            annotation_position="top left", annotation_font_color="orange",
+            row=1, col=1
+        )
+        fig.add_hline(
+            y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan",
+            annotation_text=f"直近底値 {int(recent_20_low)}円",
+            annotation_position="bottom right", annotation_font_color="cyan",
+            row=1, col=1
+        )
+
+        fig.update_layout(
+            title=f"{row['銘柄名']} 日足（3か月）＆ 価格帯別売買高",
+            xaxis_rangeslider_visible=False,
+            height=560,
+            margin=dict(l=6, r=6, t=42, b=6),
+            dragmode=False,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)'
+        )
+        fig.update_xaxes(
+            fixedrange=True,
+            tickformat="%m/%d",
+            nticks=6,
+            row=1, col=1
+        )
+        fig.update_xaxes(
+            fixedrange=True,
+            tickangle=-35,
+            type='category',
+            row=2, col=1
+        )
+        fig.update_yaxes(fixedrange=True, range=y_range, row=1, col=1)
+        fig.update_yaxes(fixedrange=True, title_text="出来高", row=2, col=1)
+
+    else:
+        fig = make_subplots(
+            rows=1, cols=2, shared_yaxes=True,
+            column_widths=[0.85, 0.15], horizontal_spacing=0
+        )
+        fig.add_trace(
+            go.Candlestick(
+                x=hist_data.index,
+                open=hist_data['Open'], high=hist_data['High'],
+                low=hist_data['Low'], close=hist_data['Close'],
+                name="株価", showlegend=False
+            ),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Bar(
+                x=bin_volumes, y=bin_centers, orientation='h',
+                marker_color='rgba(255, 165, 0, 0.6)',
+                name="出来高ボリューム", showlegend=False, hoverinfo='y'
+            ),
+            row=1, col=2
+        )
+
+        fig.add_hline(
+            y=max_vol_price, line_width=2, line_dash="dash", line_color="orange",
+            annotation_text=f" {int(max_vol_price)}円 🚧 需給の壁 ",
+            annotation_position="top left", annotation_font_color="orange",
+            row=1, col=1
+        )
+        fig.add_hline(y=max_vol_price, line_width=2, line_dash="dash", line_color="orange", row=1, col=2)
+
+        fig.add_hline(
+            y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan",
+            annotation_text=f" 直近底値(1ヶ月) 🔵 {int(recent_20_low)}円 ",
+            annotation_position="bottom right", annotation_font_color="cyan",
+            row=1, col=1
+        )
+        fig.add_hline(y=recent_20_low, line_width=1.5, line_dash="dot", line_color="cyan", row=1, col=2)
+
+        fig.update_layout(
+            title=f"{row['銘柄名']} 日足 ＆ 価格帯別出来高",
+            xaxis_rangeslider_visible=False, height=350,
+            margin=dict(l=0, r=0, t=30, b=0), dragmode=False,
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'
+        )
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True, range=y_range)
+        fig.update_xaxes(showticklabels=False, row=1, col=2)
+
     if chart_key:
         try:
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False}, key=chart_key)
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={'displayModeBar': False, 'responsive': True},
+                key=chart_key
+            )
         except TypeError:
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'responsive': True})
     else:
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'responsive': True})
+
+    if split_note:
+        st.caption(f"※ {split_note}")
 
 def render_card(ticker: str, d: Dict):
     flow_score = d.get("flow_score", 0)
@@ -1489,26 +1743,12 @@ def render_card(ticker: str, d: Dict):
 # ==========================================
 # 画面遷移
 # ==========================================
-def render_migration_banner():
-    st.markdown(f"""
-    <div class="migration-banner">
-        <div class="migration-banner-inner">
-            <div class="migration-copy">
-                <div class="migration-eyebrow">お知らせ</div>
-                <div class="migration-title"><strong>{MIGRATION_LABEL}</strong></div>
-                <a class="migration-inline-link" href="{MIGRATION_URL}" target="_blank">{MIGRATION_URL}</a>
-            </div>
-            <a class="migration-cta" href="{MIGRATION_URL}" target="_blank">新しい源太AIを開く ↗</a>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
 def show_login_page():
     logo_base64 = get_logo_base64()
-    st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
+    
     _, col2, _ = st.columns([1, 2, 1])
     with col2:
-        render_migration_banner()
         if logo_base64:
             st.markdown(f'<div style="text-align: center; margin-bottom: 1.5rem;"><img src="data:image/png;base64,{logo_base64}" class="logo-img" style="max-width: 280px; width: 90%;"></div>', unsafe_allow_html=True)
         else:
@@ -1557,7 +1797,6 @@ def show_main_page():
         st.session_state["flt_watch_only"] = False
 
     logo_base64 = get_logo_base64()
-    render_migration_banner()
     if logo_base64:
         st.markdown(f'<div style="text-align: center; margin-bottom: 0.5rem;"><img src="data:image/png;base64,{logo_base64}" class="logo-img" style="max-width: 320px; width: 80%;"></div>', unsafe_allow_html=True)
     else:
@@ -1963,9 +2202,7 @@ def show_main_page():
                                 draw_chart(diag_data, chart_key=f"hagetaka_chart_{code}")
                         else: 
                             # 🚨 ここが確実に表示されるように修正
-                            st.info(
-                                f"【 {code} 】\n\nこの銘柄は現在、判定に必要なデータを確認中です。\n少し時間を置いて再度お試しください。\n\n※銘柄コードの入力に誤りがある場合、正しく表示されません。\n※判定に必要なデータが不足している場合、結果を表示できない事があります。"
-                            )
+                            st.error(f"❌ 【 {code} 】 : データが取得できませんでした。\n\n※存在しない銘柄、または**アクセス集中による一時的な通信制限**の可能性があります。しばらく時間を空けてから再度お試しください。")
 
     # ==========================================
     # タブ3: 通知設定
