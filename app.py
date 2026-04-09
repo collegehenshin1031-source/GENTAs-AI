@@ -1759,7 +1759,10 @@ def render_migration_banner():
             <div style="font-size:1rem; font-weight:700; color:#1D4ED8; margin-bottom:10px;">
                 源太AIは移行しました。
             </div>
-            <a href="https://gentas-aiv3-production.up.railway.app" target="_self" style="
+            <a href="https://gentas-aiv3-production.up.railway.app"
+               target="_top"
+               rel="noopener noreferrer"
+               style="
                 display:inline-block;
                 background:#2563EB;
                 color:#FFFFFF;
