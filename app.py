@@ -1743,9 +1743,42 @@ def render_card(ticker: str, d: Dict):
 # ==========================================
 # 画面遷移
 # ==========================================
+def render_migration_banner():
+    st.markdown("""
+    <div style="display:flex; justify-content:center; margin:0 0 1rem 0;">
+        <div style="
+            width:100%;
+            max-width:760px;
+            background:linear-gradient(135deg, #DBEAFE 0%, #BFDBFE 100%);
+            border:1px solid #60A5FA;
+            border-radius:14px;
+            padding:14px 16px;
+            box-shadow:0 6px 18px rgba(37, 99, 235, 0.12);
+            text-align:center;
+        ">
+            <div style="font-size:1rem; font-weight:700; color:#1D4ED8; margin-bottom:10px;">
+                源太AIは移行しました。
+            </div>
+            <a href="https://gentas-aiv3-production.up.railway.app" target="_self" style="
+                display:inline-block;
+                background:#2563EB;
+                color:#FFFFFF;
+                text-decoration:none;
+                font-weight:700;
+                padding:10px 18px;
+                border-radius:999px;
+                font-size:0.95rem;
+            ">
+                新しい源太AIはこちら
+            </a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
 def show_login_page():
     logo_base64 = get_logo_base64()
     st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
+    render_migration_banner()
     
     _, col2, _ = st.columns([1, 2, 1])
     with col2:
@@ -1797,6 +1830,7 @@ def show_main_page():
         st.session_state["flt_watch_only"] = False
 
     logo_base64 = get_logo_base64()
+    render_migration_banner()
     if logo_base64:
         st.markdown(f'<div style="text-align: center; margin-bottom: 0.5rem;"><img src="data:image/png;base64,{logo_base64}" class="logo-img" style="max-width: 320px; width: 80%;"></div>', unsafe_allow_html=True)
     else:
