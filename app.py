@@ -1745,35 +1745,55 @@ def render_card(ticker: str, d: Dict):
 # ==========================================
 def render_migration_banner():
     st.markdown("""
-    <div style="display:flex; justify-content:center; margin:0 0 1rem 0;">
-        <div style="
-            width:100%;
-            max-width:760px;
-            background:linear-gradient(135deg, #DBEAFE 0%, #BFDBFE 100%);
-            border:1px solid #60A5FA;
-            border-radius:14px;
-            padding:14px 16px;
-            box-shadow:0 6px 18px rgba(37, 99, 235, 0.12);
-            text-align:center;
-        ">
-            <div style="font-size:1rem; font-weight:700; color:#1D4ED8; margin-bottom:10px;">
-                源太AIは移行しました。
-            </div>
-            <a href="https://gentas-aiv3-production.up.railway.app"
-               target="_top"
-               rel="noopener noreferrer"
-               style="
-                display:inline-block;
-                background:#2563EB;
-                color:#FFFFFF;
-                text-decoration:none;
-                font-weight:700;
-                padding:10px 18px;
-                border-radius:999px;
-                font-size:0.95rem;
-            ">
-                新しい源太AIはこちら
-            </a>
+    <style>
+    .migration-banner-wrap {
+        display:flex;
+        justify-content:center;
+        margin:0 0 1rem 0;
+    }
+    .migration-banner {
+        width:100%;
+        max-width:760px;
+        background:linear-gradient(135deg, #DBEAFE 0%, #BFDBFE 100%);
+        border:1px solid #60A5FA;
+        border-radius:14px;
+        padding:14px 16px 18px 16px;
+        box-shadow:0 6px 18px rgba(37, 99, 235, 0.12);
+        text-align:center;
+    }
+    .migration-banner-title {
+        font-size:1rem;
+        font-weight:700;
+        color:#1D4ED8;
+        margin-bottom:0.75rem;
+    }
+    div[data-testid="stLinkButton"] > a {
+        background:#2563EB !important;
+        color:#FFFFFF !important;
+        border:1px solid #2563EB !important;
+        border-radius:999px !important;
+        font-weight:700 !important;
+        padding:0.65rem 1.2rem !important;
+        text-decoration:none !important;
+    }
+    div[data-testid="stLinkButton"] > a:hover {
+        background:#1D4ED8 !important;
+        border-color:#1D4ED8 !important;
+        color:#FFFFFF !important;
+    }
+    </style>
+    <div class="migration-banner-wrap">
+        <div class="migration-banner">
+            <div class="migration-banner-title">源太AIは移行しました。</div>
+    """, unsafe_allow_html=True)
+    _, center_col, _ = st.columns([1, 2, 1])
+    with center_col:
+        st.link_button(
+            "新しい源太AIはこちら",
+            "https://gentas-aiv3-production.up.railway.app",
+            use_container_width=True,
+        )
+    st.markdown("""
         </div>
     </div>
     """, unsafe_allow_html=True)
