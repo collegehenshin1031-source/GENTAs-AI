@@ -264,6 +264,8 @@ def fetch_ohlc_history(
 
     for i in range(calendar_window):
         target = today - timedelta(days=i)
+        if target.weekday() >= 5:   # ★土曜=5, 日曜=6をスキップ
+            continue
         verbose = (i < 10)  # 最初の10件だけ詳細ログ
 
         result = _fetch_ohlc_one_day(target, auth, verbose=verbose)
