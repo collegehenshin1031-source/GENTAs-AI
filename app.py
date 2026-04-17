@@ -113,17 +113,33 @@ yf_session = get_yf_session()
 # ==========================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_kabuplus_info() -> dict:
-    """KABU+ から全銘柄の指標データを一括取得し info 辞書を構築（1時間キャッシュ）"""
+    """KABU+ から全銘柄の指標データを一括取得し info 辞書を構築（1時間キャッシュ）
+    失敗時は30分間リトライしない（404連発防止）。
+    """
+    import time
+    INFO_FAIL_KEY = "_info_fail_ts"
+    INFO_FAIL_TTL = 1800  # 失敗後30分はリトライしない
+
+    now = time.time()
+    fail_ts = st.session_state.get(INFO_FAIL_KEY, 0)
+    if (now - fail_ts) < INFO_FAIL_TTL:
+        return {}
+
     try:
         uid, pwd = kp.get_credentials()
         if not uid or not pwd:
+            st.session_state[INFO_FAIL_KEY] = now
             return {}
         merged = kp.fetch_merged_data(uid, pwd)
         if merged.empty:
+            print("⚠️ [_load_kabuplus_info] 取得失敗（空データ）")
+            st.session_state[INFO_FAIL_KEY] = now
             return {}
+        st.session_state.pop(INFO_FAIL_KEY, None)  # 成功したら失敗記録を消す
         return kp.build_info_lookup(merged)
     except Exception as e:
         print(f"⚠️ [_load_kabuplus_info] 取得失敗: {e}")
+        st.session_state[INFO_FAIL_KEY] = now
         return {}
 
 
@@ -134,40 +150,52 @@ def _get_kabuplus_info(ticker: str) -> dict:
 
 def _load_kabuplus_margin() -> dict:
     """KABU+ から全銘柄の信用残高データを一括取得し辞書を構築。
-    信用残高は週次（金曜日更新）のため、直近金曜のCSVを優先取得する。
+    信用残高は週次（火曜日更新）のため、直近火曜のCSVを優先取得する。
     取得成功時のみ session_state にキャッシュ（6時間）。
-    空データはキャッシュしないことで、再起動なしに次回取得を試みる。
+    失敗時は30分間リトライしない（404連発防止）。
     """
     import time
-    CACHE_KEY = "_margin_cache"
+    CACHE_KEY  = "_margin_cache"
     CACHE_TS   = "_margin_cache_ts"
-    TTL = 21600  # 6時間（週次データ）
+    FAIL_TS    = "_margin_fail_ts"
+    TTL        = 21600  # 成功キャッシュ: 6時間
+    FAIL_TTL   = 1800   # 失敗キャッシュ: 30分
 
-    # session_state キャッシュヒット確認
     now = time.time()
-    cached = st.session_state.get(CACHE_KEY)
+
+    # 成功キャッシュヒット
+    cached    = st.session_state.get(CACHE_KEY)
     cached_ts = st.session_state.get(CACHE_TS, 0)
     if cached is not None and (now - cached_ts) < TTL:
         return cached
+
+    # 失敗キャッシュヒット（30分以内の失敗はスキップ）
+    fail_ts = st.session_state.get(FAIL_TS, 0)
+    if (now - fail_ts) < FAIL_TTL:
+        return {}
 
     # KABU+ から取得
     try:
         uid, pwd = kp.get_credentials()
         if not uid or not pwd:
+            st.session_state[FAIL_TS] = now
             return {}
         margin_df = kp.fetch_margin_data(uid, pwd)
         if margin_df.empty:
-            print("⚠️ [_load_kabuplus_margin] KABU+信用残高CSV空（金曜CSVが未公開の可能性）")
-            return {}  # 空はキャッシュしない
+            print("⚠️ [_load_kabuplus_margin] KABU+信用残高CSV空（未公開の可能性）")
+            st.session_state[FAIL_TS] = now
+            return {}
         result = kp.build_margin_lookup(margin_df)
         if result:
             st.session_state[CACHE_KEY] = result
             st.session_state[CACHE_TS]  = now
+            st.session_state.pop(FAIL_TS, None)  # 成功したら失敗記録を消す
             print(f"✅ [_load_kabuplus_margin] {len(result)}銘柄 取得・キャッシュ完了")
         return result
     except Exception as e:
         print(f"⚠️ [_load_kabuplus_margin] 取得失敗: {e}")
-        return {}  # 空はキャッシュしない
+        st.session_state[FAIL_TS] = now
+        return {}
 
 # ==========================================
 # カート操作のコールバック関数（即時反映用）
